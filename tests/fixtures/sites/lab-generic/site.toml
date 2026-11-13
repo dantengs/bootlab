@@ -1,0 +1,53 @@
+# Test fixture: a made-up site for the unit tests. The numbers come from real measurements; the names,
+# paths and addresses are placeholders.
+sif = "/shared/user/apptainer/images/bootlab-exec-2026.11-r3.sif"
+binds = ["/shared"]
+python = "/shared/user/bootlab/python/bin/python3"
+setup = "setup.sh"
+generator = "/opt/bootlab/bin/generator"
+pmp2sdp = "pmp2sdp_3.0sky"
+dynamical_sdp = "dynamical_sdp_RV1B_3.0sky"
+runs = "/shared/user/bootlab/runs"
+scratch = ["/nonexistent-local-scratch/$USER-bootlab", "shared"]
+driver_reserve_mb = 4096
+bench = "../lab/bench"
+env_unset = ["UCX_NET_DEVICES", "OMPI_MCA_plm"]
+
+[slurm]
+partition = "normal"
+time = "48:00:00"
+
+[env]
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
+OMPI_MCA_pml = "ucx"
+OMPI_MCA_btl = "^openib"
+UCX_POSIX_USE_PROC_LINK = "n"
+PMIX_MCA_gds = "hash"
+UCX_LOG_FILE = "stderr"
+OMPI_MCA_pml_ucx_num_disconnect = "1000000"
+UCX_TLS = "tcp,self,sm"
+
+[mpi]
+transport = "tcp-1g"
+net_devices = ["subnet:10.20.0."]
+
+[node_types.amd2]
+hosts = ["nodeb-*"]
+physical_cores = 256
+mem_gb = 367
+[node_types.amd1]
+hosts = ["nodea-*"]
+physical_cores = 128
+mem_gb = 247
+
+[multinode]
+prefer = ["amd2", "amd1"]
+peers = ["nodea-0", "nodea-1", "nodea-2",
+         "nodeb-0", "nodeb-1", "nodeb-2", "nodeb-3", "nodeb-4"]
+max_nodes = 3
+min_efficiency = 0.8
+min_gain = 1.15
+transfer = "srun"
+copy_network = "10.20.0."
+copy_streams = 4

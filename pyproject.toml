@@ -1,0 +1,12 @@
+[project]
+name = "bootlab"
+version = "0.1.0"
+description = "Three-layer numerical conformal bootstrap: physics files -> PMP -> SDPB solvers"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+bootlab = "bootlab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

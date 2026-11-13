@@ -1,0 +1,118 @@
+# A bootlab site: copy this directory to sites/<name>/, fill in the values, and name the site in run.toml
+# ([exec] site = "<name>"). Only what this file and setup.sh say is used; nothing else of the cluster is
+# assumed. `bootlab site gen` writes a site from the probe's measurements; this file
+# explains the keys for a site written by hand.
+#
+# What the cluster must have:
+#   - Slurm >= 21.08 (srun --exact; srun --overlap since 20.11), sbatch --wrap; an MPI plugin for srun that the
+#     image's Open MPI 4.1 talks to ([mpi] plugin, default pmix: srun --mpi=pmix).
+#   - apptainer >= 1.1 on the nodes (setup.sh puts it on PATH); the bootlab image (sif below) readable from them.
+#   - A file system every node of a job sees, for runs (and for the scratch when there is no local one). It
+#     must make hard links: the solver writes its checkpoint in the run directory and bootlab keeps each
+#     step's generation by hard links (docs/en/interfaces.md section 11); a run stops at the start when it cannot.
+#   - Python >= 3.11 for the driver (tomllib, hashlib.file_digest), standard library only, on that shared file
+#     system or at the same path on every node (the copies' receiver runs it too). install.sh copies the
+#     image's Python 3.12 (r5 and later) to <install root>/python, which is used when python is left out.
+#   - The nodes' cgroup v2 (as Slurm makes it) for the pmp2sdp memory watchdog; without it the watchdog is off
+#     and driver.log says so (the memory per pmp2sdp is then the node's MemTotal - MemAvailable rise).
+#   - For one solve on several nodes: TCP between the nodes on the ephemeral ports (32768-60999 on Linux), for
+#     MPI and for the copies; the nodes listed as peers below.
+#   - One solve on several nodes over Ethernet TCP only (no InfiniBand) is not recommended: with a few hundred
+#     ranks a node, MPI's all-to-all TCP connections failed at start-up on the cluster bootlab was tested on
+#     (connect() refused or "Cannot assign requested address", then UCX "Destination is unreachable"; 2 x 256
+#     ranks failed 6 of 7 times, 2 x 128 1 of 2, 1 rank a node never; docs/en/interfaces.md section 14; the
+#     kernel settings of those nodes were not changed; the cause is not verified). There, leave
+#     [multinode] out: one node always.
+
+# sif, python and runs may be left out: then the installation's bootlab.toml has them (bootlab.example.toml;
+# python: else <install root>/python/bin/python3; runs: else <install root>/runs; $BOOTLAB_RUNS overrides both).
+sif = "/path/to/bootlab-exec-2026.11-r5.sif"
+# Bound into the container. The runs directory must be under one; the scratch directory chosen at the start
+# and the run directory are added when they are not.
+binds = ["/shared"]
+python = "/shared/python3.12/bin/python3"
+setup = "setup.sh"                       # sourced by the job, and by a remote shell with transfer = "ssh"
+generator = "/opt/bootlab/bin/generator" # in the image
+pmp2sdp = "pmp2sdp_3.0sky"               # in the image
+dynamical_sdp = "dynamical_sdp_RV1B_3.0sky"
+runs = "/shared/bootlab/runs"            # run directories (with the solver's checkpoint), Slurm's output
+# The run's large files (PMP, SDP, the generator's block tables): candidates in order,
+# the first that every node of the job resolves to the same path and can write ($VARS are the node's own);
+# "shared" = <run dir>/work on the runs file system (then nothing is copied between nodes, every node reads
+# node 0's files). One plain path: used as it is, no check.
+scratch = ["$SLURM_TMPDIR/bootlab", "/local/scratch/$USER-bootlab", "shared"]
+driver_reserve_mb = 4096                 # memory kept back from the steps for the driver and the page cache
+# Measured data (sites/<name>/bench/<node type>.json): solver processes, pmp2sdp at once, nodes for one
+# solve. Left out: bench/ here; none at all means all physical cores, one node, pmp2sdp measured at step 1.
+# bench = "../other-site/bench"
+# Removed from the driver's environment before [env] is applied.
+env_unset = ["UCX_NET_DEVICES", "OMPI_MCA_plm"]
+
+# bootlab submit's sbatch options (it adds --exclusive --hint=nomultithread --mem=0 and the nodes).
+[slurm]
+partition = "batch"
+time = "48:00:00"
+# account = "..."
+# extra = ["--qos=normal"]
+
+# The driver's environment; every step inherits it. The first six are what the image needs whatever the
+# cluster: each rank runs in its own apptainer instance, so UCX cannot open another rank's /proc/<pid>/fd and
+# the PMIx dstore does not work across them.
+[env]
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
+OMPI_MCA_pml = "ucx"
+OMPI_MCA_btl = "^openib"
+UCX_POSIX_USE_PROC_LINK = "n"
+PMIX_MCA_gds = "hash"
+UCX_LOG_FILE = "stderr"
+OMPI_MCA_pml_ucx_num_disconnect = "1000000"
+# The MPI transport between nodes: InfiniBand "rc,self,sm"; TCP "tcp,self,sm".
+UCX_TLS = "tcp,self,sm"
+
+[mpi]
+# ib, tcp-ipoib or tcp-1g (or another name): the bench rows of more than one node must say the same
+# ("transport"), or layout does not use them.
+transport = "tcp-1g"
+# The device each rank's UCX uses (bootlab's src/bootlab/rank_env.sh): rules, the first matching wins,
+#   "<host glob>=<device>" (an IB port: "node0[1-4]=mlx5_0:1") or "subnet:<IPv4 prefix>" (the interface with an
+#   address on that network: TCP). Left out: UCX's own choice.
+net_devices = ["subnet:10.0.0."]
+
+# Node types: physical cores (not hyperthreads), memory, and the host names (fnmatch patterns). bench/<type>.json
+# holds each type's measurements. A host no pattern matches is of type "default".
+[node_types.cpu]
+hosts = ["node[0-9][0-9]"]
+physical_cores = 64
+mem_gb = 250
+
+# One solve on more than one node (left out: one node always).
+[multinode]
+# allowed = false: one node unless run.toml [resources] allow_multinode = true (written by bootlab site gen when
+# the pair probe did not pass, or over TCP, or without a local disk; basis says which, with the probe job).
+# allowed = false
+# basis = "cpu: IB rc start-up passed 2 of 3, 3 needed (pair probe 1234)"
+prefer = ["cpu"]
+peers = ["node01", "node02", "node03"]   # nodes that may solve together (TCP open between them)
+max_nodes = 2
+# One more node only if t(1) / (k t(k)) >= min_efficiency and t(k-1) / t(k) >= min_gain, from the bench.
+min_efficiency = 0.8
+min_gain = 1.15
+# srun (default): every remote action is a light srun step; the step's SDPs go over TCP to a receiver started
+# that way, on copy_network's addresses when given (an IPv4 prefix of a fast network), else to the host name.
+transfer = "srun"
+copy_network = "10.0.0."
+copy_streams = 4
+# ssh instead (only where ssh into the job's nodes works):
+# transfer = "ssh"
+# ipoib_prefix = "10.10.0."
+# ssh = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "UserKnownHostsFile={site}/known_hosts"]
+# remote_setup = "source {site}/setup.sh"
+
+# The runs file system as the probe saw it (bootlab site gen): the start writes each node's way to it in
+# driver.log and warns, without stopping, when a node's server or network differs (an NFS mount can fall back
+# to a slower network at mount time).
+# [shared_network]
+# server = "<the NFS server's address>"
+# network = "ipoib"
+# basis = "node probes 1234, 1235"

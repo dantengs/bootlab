@@ -1,0 +1,48 @@
+{
+ "model": {
+  "name": "data",
+  "file": "/cluster/work/bootlab-physics-check/models/ising-oe.model.json",
+  "spectrum": {
+   "gaps": [
+    {
+     "channel": "rep1+",
+     "gap": 3,
+     "spins": [
+      0
+     ]
+    },
+    {
+     "channel": "rep2+",
+     "gap": 3,
+     "spins": [
+      0
+     ]
+    }
+   ],
+   "isolated": [],
+   "twistGap": 0
+  }
+ },
+ "points": [
+  [
+   0.517075,
+   1.396575,
+   0.964
+  ],
+  [
+   0.518149,
+   1.412625,
+   0.96926
+  ],
+  [
+   0.5182,
+   1.4125,
+   0.969
+  ]
+ ],
+ "job": {
+  "nodes": 1,
+  "tasksPerNode": 4,
+  "hours": 8
+ }
+}

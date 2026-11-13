@@ -1,0 +1,17 @@
+format = "bootlab-spectrum/1"
+default_above_unitarity = "0.000001"
+
+[[gap]]
+channel = "rep1+"
+spins   = [0]
+delta   = "deltaEpsP"
+
+[[gap]]
+channel = "rep2+"
+spins   = [0]
+delta   = "deltaSig + 2"
+
+[[gap]]
+channel = "rep1+"
+spins   = [2]
+above_unitarity = "(deltaEpsP - deltaEps)/2"

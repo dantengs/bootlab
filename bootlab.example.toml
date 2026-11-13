@@ -1,0 +1,18 @@
+# This installation's own settings: copy to bootlab.toml in the install root (the directory with src/ and
+# sites/) and fill in. bootlab.toml is not in the repository or the package: the code
+# and the shipped files hold no path of a particular cluster. Relative paths are from the install root;
+# $VARIABLES are expanded. Every key may be left out.
+
+# The site when run.toml's [exec] names none (sites/<site>/site.toml).
+site = "mysite"
+
+# The bootlab image, when the site's site.toml has no sif.
+image = "/path/to/bootlab-exec.sif"
+
+# Where the run directories go, when the site has no runs (default: runs/ in the install root). The environment
+# variable BOOTLAB_RUNS overrides every other setting.
+runs = "runs"
+
+# The driver's Python (>= 3.11), when the site has none (default: python/bin/python3 in the install root, the
+# Python copied out of the image, when it exists).
+# python = "python/bin/python3"

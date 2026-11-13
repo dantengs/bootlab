@@ -1,0 +1,39 @@
+# Ising sigma-epsilon Skydive at Lambda = 19 to its end point (docs/en/interfaces.md section 10): the gap upper
+# limit 1e-12 at the first solver call, then following N (gap_upper_limit_track = 1, kappa 0.1); infinitesimal
+# 1e-20 (the default); the Hessian from the solver; the solver ends when the duality gap is below 1e-20,
+# tightened with |N|. A real case that runs to a converged end point.
+format = "bootlab-run/1"
+name   = "ising-l19-skydive"
+
+[inputs]
+model     = "../ising/model.json"       # the ising-oe model
+spectrum  = "../ising/spectrum.toml"
+objective = "../ising/objective.toml"
+
+[numerics]
+lambda       = 19
+block_preset = "simpleboot"
+
+[coords]
+names = ["deltaSig", "deltaEps", "theta"]
+
+[skydive]
+start          = ["0.518149", "1.412625", "0.9692"]
+max_steps      = 300
+box_min        = ["0.517", "1.2", "0.95"]
+box_max        = ["0.530", "1.5", "0.99"]
+stop_on_negative = false
+hessian_guess  = []
+find_boundary_direction    = []
+find_boundary_when_allowed = true
+gap_upper_limit            = "1e-12"   # the first call's; after it min(1e-12, max(c |N|, 0.1 |N_1|, 1e-27))
+gap_upper_limit_first_only = false
+gap_upper_limit_track      = "1"       # c; load takes 0 < c <= 3 (SPEC 6: untested with correct gradients above)
+
+# Over skydive.solver_defaults(10). The gap upper limit must stay above dualityGapThreshold (load checks it).
+[solver]
+dualityGapThreshold  = "1e-20"
+primalErrorThreshold = "1e-30"
+dualErrorThreshold   = "1e-30"
+
+[dynamical]

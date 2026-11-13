@@ -1,0 +1,37 @@
+# Ising sigma-epsilon Skydive at Lambda = 11, with the reference program's (bt r3.8) Ising Skydive settings, for the comparison with it.
+format = "bootlab-run/1"
+name   = "ising-l11-skydive"
+
+[inputs]
+model     = "model.json"          # the ising-oe model (simpleboot's AutoEqu_Ising_OE)
+spectrum  = "spectrum.toml"
+objective = "objective.toml"
+
+[numerics]
+lambda       = 11
+block_preset = "simpleboot"
+
+[coords]
+names = ["deltaSig", "deltaEps", "theta"]
+
+[skydive]
+start          = ["0.519", "1.4", "0.956"]
+max_steps      = 300
+box_min        = ["0.517", "1.2", "0.95"]
+box_max        = ["0.530", "1.5", "0.99"]
+stop_on_negative = false
+hessian_guess  = ["1000000", "10000", "1000"]
+find_boundary_direction    = []
+find_boundary_when_allowed = true
+gap_upper_limit            = "0.1"     # bt's default (upstream's); bt passes it at every step
+gap_upper_limit_first_only = false
+gap_upper_limit_track      = "off"     # bt's fixed limit at every call; tracking N is the default (SPEC 6)
+infinitesimal  = "1e-20"               # bt's default (upstream's)
+
+# SDPB's options by flag name, over skydive.solver_defaults (what bt r3.8 passes at this Lambda's nmax:
+# gap 1e-6, errors 1e-12, feasible centering 0.3, maxIterations 1000, ...) and maxRuntime (the job's time
+# left less 15 minutes).
+[solver]
+
+# dynamical_sdp's own options; the rest are skydive.DYNAMICAL_DEFAULTS (upstream's).
+[dynamical]

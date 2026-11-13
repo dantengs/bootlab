@@ -1,0 +1,10 @@
+{
+ "model": {
+  "name": "data",
+  "file": "/cluster/work/bootlab-physics-check/models/ising-oe.model.json",
+  "lambda": 11
+ },
+ "points": [
+  []
+ ]
+}

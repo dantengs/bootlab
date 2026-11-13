@@ -1,0 +1,23 @@
+# Test fixture: the Ising model with four extra point parameters, so a point has 7 coordinates (8 points a step)
+format = "bootlab-spectrum/1"
+default_above_unitarity = "0"
+
+[[gap]]
+channel = "rep1+"
+spins   = [0]
+delta   = "pA"
+
+[[gap]]
+channel = "rep2+"
+spins   = [0]
+delta   = "pB"
+
+[[gap]]
+channel = "rep1+"
+spins   = [2]
+delta   = "pC"
+
+[[gap]]
+channel = "rep2-"
+spins   = [1]
+delta   = "pD"

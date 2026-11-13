@@ -1,0 +1,2 @@
+format = "bootlab-objective/1"
+kind   = "navigator"     # the model's navigator: identity as objective, simpleboot's Sigma normalization

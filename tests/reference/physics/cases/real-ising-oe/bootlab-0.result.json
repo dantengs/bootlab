@@ -1,0 +1,6 @@
+{
+ "set": "feasibility",
+ "exit": 0,
+ "stdout": "{\"job\":{\"hours\":8,\"nodes\":1,\"tasksPerNode\":4},\"model\":{\"blockKeptPoleOrder\":null,\"blockOrder\":null,\"blockPrecision\":null,\"blockPreset\":null,\"file\":\"/cluster/work/bootlab-physics-check/models/ising-oe.model.json\",\"gapZ2Even\":null,\"gapZ2Odd\":null,\"lambda\":null,\"name\":\"data\",\"nmax\":6,\"spectrum\":{\"gaps\":[{\"channel\":\"rep1+\",\"gap\":3,\"spins\":[0]},{\"channel\":\"rep2+\",\"gap\":3,\"spins\":[0]}],\"isolated\":[],\"twistGap\":0},\"spinList\":null},\"points\":[[0.517075,1.396575,0.964],[0.518149,1.412625,0.96926],[0.5182,1.4125,0.969]],\"solver\":{\"dualError\":null,\"dualityGap\":null,\"feasibleCentering\":null,\"initialMatrixScaleDual\":null,\"initialMatrixScalePrimal\":null,\"maxComplementarity\":null,\"primalError\":null,\"solverMaxIterations\":null,\"solverPrecision\":null}}\n",
+ "stderr": ""
+}

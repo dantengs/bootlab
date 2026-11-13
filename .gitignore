@@ -1,0 +1,7 @@
+__pycache__/
+# made by install.sh and by use
+/python/
+/bin/
+/bootlab.toml
+/runs/
+/probe*/

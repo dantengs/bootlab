@@ -1,0 +1,68 @@
+# Test fixture: a made-up site for the unit tests. The numbers come from real measurements; the names,
+# paths and addresses are placeholders.
+sif = "/shared/user/apptainer/images/bootlab-exec-2026.11-r3.sif"
+binds = ["/shared", "/local/scratch"]
+python = "/shared/user/bootlab/python/bin/python3"
+setup = "setup.sh"
+generator = "/opt/bootlab/bin/generator"
+scratch = "/local/scratch/user-bootlab"
+runs = "/shared/user/bootlab/runs"
+pmp2sdp = "pmp2sdp_3.0sky"
+dynamical_sdp = "dynamical_sdp_RV1B_3.0sky"
+driver_reserve_mb = 4096
+env_unset = ["OMPI_MCA_plm", "UCX_NET_DEVICES"]
+
+[slurm]
+partition = "normal"
+time = "48:00:00"
+
+[env]
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
+OMPI_MCA_pml = "ucx"
+OMPI_MCA_btl = "^openib"
+UCX_POSIX_USE_PROC_LINK = "n"
+PMIX_MCA_gds = "hash"
+UCX_LOG_FILE = "stderr"
+OMPI_MCA_pml_ucx_num_disconnect = "1000000"
+UCX_TLS = "rc,self,sm"
+
+[mpi]
+transport = "ib"
+net_devices = ["nodeb-0=mlx5_0:1", "nodeb-1=mlx5_0:1", "nodeb-3=mlx5_0:1",
+               "nodea-2=mlx5_0:1", "noded-0=mlx5_0:1", "nodec-0=mlx5_0:1",
+               "nodez-0=mlx5_0:1",
+               "nodeb-2=mlx5_1:1", "nodeb-4=mlx5_1:1", "nodea-0=mlx5_1:1",
+               "nodea-1=mlx5_1:1", "nodec-1=mlx5_1:1"]
+
+[node_types.amd2]
+hosts = ["nodeb-*"]
+physical_cores = 256
+mem_gb = 367
+[node_types.amd1]
+hosts = ["nodea-*"]
+physical_cores = 128
+mem_gb = 247
+[node_types.intel1]
+hosts = ["nodec-*"]
+physical_cores = 96
+mem_gb = 503
+[node_types.intel2]
+hosts = ["noded-*"]
+physical_cores = 96
+mem_gb = 1511
+
+[multinode]
+prefer = ["amd2", "amd1"]
+peers = ["nodea-0", "nodea-1", "nodea-2",
+         "nodeb-0", "nodeb-1", "nodeb-2", "nodeb-3", "nodeb-4",
+         "nodec-1", "noded-0"]
+max_nodes = 3
+min_efficiency = 0.8
+min_gain = 1.15
+copy_streams = 8
+transfer = "ssh"
+ipoib_prefix = "10.10.0."
+ssh = ["/usr/bin/ssh", "-c", "aes128-gcm@openssh.com", "-o", "BatchMode=yes",
+       "-o", "UserKnownHostsFile=~/.ssh/known_hosts {site}/known_hosts"]
+remote_setup = "source {site}/setup.sh"

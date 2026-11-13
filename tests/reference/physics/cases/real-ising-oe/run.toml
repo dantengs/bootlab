@@ -1,0 +1,14 @@
+format = "bootlab-run/1"
+name   = "real-ising-oe"
+
+[inputs]
+model     = "../../models/ising-oe.model.json"
+spectrum  = "spectrum.toml"
+objective = "objective.toml"
+
+[numerics]
+lambda       = 11
+block_preset = "simpleboot"
+
+[coords]
+names = ["deltaSig", "deltaEps", "theta"]

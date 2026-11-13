@@ -1,0 +1,6 @@
+{
+ "set": "feasibility",
+ "exit": 1,
+ "stdout": "",
+ "stderr": "scalars-3d-exec: user error (the parameters do not fit model data:\n  point [] needs 3 coordinates: deltaSig, deltaEps, theta)\n"
+}

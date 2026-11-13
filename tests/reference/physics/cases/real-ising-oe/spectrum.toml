@@ -1,0 +1,12 @@
+format = "bootlab-spectrum/1"
+default_above_unitarity = "0"
+
+[[gap]]
+channel = "rep1+"
+spins   = [0]
+delta   = "3"
+
+[[gap]]
+channel = "rep2+"
+spins   = [0]
+delta   = "3"

@@ -1,0 +1,27 @@
+# Test fixture: a 7-coordinate run at Lambda = 27 (the bench fixture has rows of this model and Lambda)
+format = "bootlab-run/1"
+name   = "seven-l27"
+
+[inputs]
+model     = "model.json"
+spectrum  = "spectrum.toml"
+objective = "objective.toml"
+
+[numerics]
+lambda       = 27
+block_preset = "simpleboot"
+
+[coords]
+names = ["deltaSig", "deltaEps", "theta", "pA", "pB", "pC", "pD"]
+
+[skydive]
+start     = ["0.5181", "1.4126", "0.969", "3.8", "4.2", "4.5", "3.1"]
+max_steps = 10
+box_min   = ["0.51", "1.4", "0.9", "3", "3", "4", "2.5"]
+box_max   = ["0.53", "1.5", "1", "5", "5", "5", "4"]
+gap_upper_limit = "1e-12"
+
+[solver]
+dualityGapThreshold = "1e-20"
+
+[dynamical]

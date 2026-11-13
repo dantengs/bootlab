@@ -1,0 +1,418 @@
+{
+ "format": "bt-model/2",
+ "name": "ising-oe-gff",
+ "source": "simpleboot AutoEqu file AutoEqu_Ising_OE.txt",
+ "dimension": 3,
+ "externals": [
+  {
+   "name": "sig",
+   "delta": "deltaSig"
+  },
+  {
+   "name": "eps",
+   "delta": "deltaEps"
+  }
+ ],
+ "rows": [
+  "odd",
+  "all",
+  "odd",
+  "odd"
+ ],
+ "channels": [
+  {
+   "name": "rep2-",
+   "spins": "odd",
+   "basis": [
+    "sig eps"
+   ],
+   "matrices": [
+    [
+     [
+      [
+       {
+        "F": [
+         "sig",
+         "eps",
+         "sig",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "coeff": "1",
+        "T": [
+         "eps",
+         "sig",
+         "sig",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ],
+    0,
+    0
+   ]
+  },
+  {
+   "name": "rep2+",
+   "spins": "even",
+   "basis": [
+    "sig eps"
+   ],
+   "matrices": [
+    [
+     [
+      [
+       {
+        "F": [
+         "sig",
+         "eps",
+         "sig",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "coeff": "-1",
+        "T": [
+         "eps",
+         "sig",
+         "sig",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ],
+    0,
+    0
+   ]
+  },
+  {
+   "name": "rep1+",
+   "spins": "even",
+   "basis": [
+    "eps eps",
+    "sig sig"
+   ],
+   "matrices": [
+    0,
+    [
+     [
+      0,
+      [
+       {
+        "coeff": "1/2",
+        "S": [
+         "sig",
+         "sig",
+         "eps",
+         "eps"
+        ]
+       }
+      ]
+     ],
+     [
+      [
+       {
+        "coeff": "1/2",
+        "S": [
+         "sig",
+         "sig",
+         "eps",
+         "eps"
+        ]
+       }
+      ],
+      0
+     ]
+    ],
+    [
+     [
+      0,
+      0
+     ],
+     [
+      0,
+      [
+       {
+        "F": [
+         "sig",
+         "sig",
+         "sig",
+         "sig"
+        ]
+       }
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "F": [
+         "eps",
+         "eps",
+         "eps",
+         "eps"
+        ]
+       }
+      ],
+      0
+     ],
+     [
+      0,
+      0
+     ]
+    ]
+   ]
+  }
+ ],
+ "fixed": [
+  {
+   "name": "identity",
+   "delta": "0",
+   "spin": 0,
+   "matrices": [
+    0,
+    [
+     [
+      [
+       {
+        "coeff": "1",
+        "S": [
+         "sig",
+         "sig",
+         "eps",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "F": [
+         "sig",
+         "sig",
+         "sig",
+         "sig"
+        ]
+       }
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "F": [
+         "eps",
+         "eps",
+         "eps",
+         "eps"
+        ]
+       }
+      ]
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "external",
+   "basis": [
+    "sig sig eps",
+    "eps eps eps"
+   ],
+   "matrices": [
+    [
+     [
+      [
+       {
+        "F": [
+         "sig",
+         "eps",
+         "sig",
+         "eps"
+        ],
+        "exchanged": "sig"
+       }
+      ],
+      0
+     ],
+     [
+      0,
+      0
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "coeff": "-1",
+        "T": [
+         "eps",
+         "sig",
+         "sig",
+         "eps"
+        ],
+        "exchanged": "sig"
+       }
+      ],
+      [
+       {
+        "coeff": "1/2",
+        "S": [
+         "sig",
+         "sig",
+         "eps",
+         "eps"
+        ],
+        "exchanged": "eps"
+       }
+      ]
+     ],
+     [
+      [
+       {
+        "coeff": "1/2",
+        "S": [
+         "sig",
+         "sig",
+         "eps",
+         "eps"
+        ],
+        "exchanged": "eps"
+       }
+      ],
+      0
+     ]
+    ],
+    [
+     [
+      [
+       {
+        "F": [
+         "sig",
+         "sig",
+         "sig",
+         "sig"
+        ],
+        "exchanged": "eps"
+       }
+      ],
+      0
+     ],
+     [
+      0,
+      0
+     ]
+    ],
+    [
+     [
+      0,
+      0
+     ],
+     [
+      0,
+      [
+       {
+        "F": [
+         "eps",
+         "eps",
+         "eps",
+         "eps"
+        ],
+        "exchanged": "eps"
+       }
+      ]
+     ]
+    ]
+   ],
+   "opeAngle": true
+  }
+ ],
+ "objectives": {
+  "feasibility": {
+   "constraints": [
+    "external"
+   ],
+   "objective": [],
+   "normalization": [
+    {
+     "fixed": "identity"
+    }
+   ]
+  },
+  "navigator": {
+   "constraints": [
+    "external"
+   ],
+   "objective": [
+    {
+     "fixed": "identity"
+    }
+   ],
+   "sigma": {
+    "shift": "1/5",
+    "step": "3/10",
+    "width": "6"
+   }
+  },
+  "navigator_gff": {
+   "constraints": [
+    "external"
+   ],
+   "objective": [
+    {
+     "fixed": "identity"
+    }
+   ],
+   "normalization": [
+    {
+     "coeff": "-1",
+     "channel": "rep1+",
+     "spin": 0,
+     "delta": "2*deltaSig",
+     "lambda": [
+      "0",
+      "sqrt(2)"
+     ]
+    },
+    {
+     "coeff": "-1",
+     "channel": "rep1+",
+     "spin": 0,
+     "delta": "2*deltaEps",
+     "lambda": [
+      "sqrt(2)",
+      "0"
+     ]
+    },
+    {
+     "coeff": "-1",
+     "channel": "rep2+",
+     "spin": 0,
+     "delta": "deltaSig+deltaEps",
+     "lambda": [
+      "1"
+     ]
+    }
+   ]
+  }
+ }
+}

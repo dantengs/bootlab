@@ -1,0 +1,13 @@
+format = "bootlab-spectrum/1"
+# ising-oe: rep1 is Z2-even, rep2 is Z2-odd; "+" even spins, "-" odd spins.
+default_above_unitarity = "0"
+
+[[gap]]
+channel = "rep1+"        # the next Z2-even scalar after epsilon
+spins   = [0]
+delta   = "3"
+
+[[gap]]
+channel = "rep2+"        # the next Z2-odd scalar after sigma
+spins   = [0]
+delta   = "3"
