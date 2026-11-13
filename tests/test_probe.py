@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -97,7 +98,8 @@ class Node(unittest.TestCase):
     def test_local_extra(self):
         """--local: a site's scratch directory that is not a mount point (a directory of /) is a candidate, before
         the usual names, and plan hands it to the node jobs."""
-        with tempfile.TemporaryDirectory() as d:
+        bare = {k: v for k, v in os.environ.items() if k not in ("TMPDIR", "SLURM_TMPDIR")}   # those come first
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, bare, clear=True):
             mounts = probe.parse_mountinfo("22 1 259:2 / / rw,relatime - xfs /dev/nvme0n1p2 rw\n")
             paths = [c["path"] for c in probe.local_candidates(mounts, "0:52", [d])]
             self.assertEqual(paths[0], d)

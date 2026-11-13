@@ -185,11 +185,17 @@ def cmd_plan(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     args.setup = apptainer_setup()
-    s = run(["sinfo", "-N", "-h", "-o", SINFO_FORMAT])
+    # --partition: that partition's nodes only, the jobs go to it; --node: that node, busy or not (the job waits)
+    s = run(["sinfo", "-N", "-h", "-o", SINFO_FORMAT] + (["-p", args.partition] if args.partition else []))
     if s["exit"] != 0:
         raise SystemExit(f"sinfo failed: {s['err']}")
     nodes = parse_sinfo(s["out"])
     types = node_types(nodes)
+    if args.node and args.what != "node":
+        raise SystemExit("--node is for node probes")
+    if args.node and not any(args.node in t["hosts"] for t in types.values()):
+        raise SystemExit(f"--node {args.node} is not among the nodes sinfo lists"
+                         + (f" in partition {args.partition}" if args.partition else ""))
     cfg = run(["scontrol", "show", "config"])
     conf = dict(re.findall(r"^(\w+)\s+=\s+(.*?)\s*$", cfg["out"], flags=re.M))
     mpi = run(["srun", "--mpi=list"])
@@ -204,21 +210,27 @@ def cmd_plan(args):
             "slurm": {k: conf.get(k) for k in ("SLURM_VERSION", "MpiDefault", "SelectType", "SelectTypeParameters",
                                                "ProctrackType", "TaskPlugin", "JobAcctGatherType")},
             "srun_mpi": mpi["out"] + mpi["err"], "nodes": nodes, "types": {}}
+    if args.partition:
+        plan["partition"] = args.partition
     python = args.python or sys.executable
     plan["what"] = args.what
     if args.what == "pair" and not args.sdp:
         raise SystemExit("--what pair needs --sdp (a small SDP for the start-up test)")
     wanted = set(args.types.split(",")) if args.types else set(types)
+    if args.node:
+        wanted = {name for name, t in types.items() if args.node in t["hosts"]}
     for name, t in types.items():
         if name not in wanted:
             continue
-        idle = idle_hosts(nodes, t["hosts"])
+        idle = [args.node] if args.node else idle_hosts(nodes, t["hosts"])
         if args.what == "node":
             hosts = idle[:1]
             job = node_job(hosts[0], args, python) if hosts else None
         else:
             hosts = idle[:2] if len(idle) >= 2 else []
             job = pair_job(hosts, t["physical_cores"], args, python) if hosts else None
+        if job and args.partition:
+            job = job[:1] + [f"--partition={args.partition}"] + job[1:]
         plan["types"][name] = {**t, "probe_hosts": hosts, "sbatch": job}
         print(f"{name}: {len(t['hosts'])} nodes, {t['physical_cores']} physical cores, {t['mem_mb']} MB; "
               + (f"{args.what} probe on {','.join(hosts)}" if job else f"not enough idle nodes for a {args.what} probe"))
@@ -779,6 +791,153 @@ def cmd_node(args):
     print(f)
 
 
+# ---------------------------------------------------------------------------------------------- local
+
+def allowed_cpus(text: str) -> set:
+    """'3,99' or '0-3,8' (Cpus_allowed_list) -> {3, 99}."""
+    out = set()
+    for part in text.strip().split(","):
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
+def core_threads(sysdir: Path = Path("/sys/devices/system/cpu")) -> dict:
+    """cpu -> the set of hardware threads of its physical core (thread_siblings_list)."""
+    out = {}
+    for d in sysdir.glob("cpu[0-9]*"):
+        f = d / "topology" / "thread_siblings_list"
+        if f.exists():
+            out[int(d.name[3:])] = allowed_cpus(f.read_text())
+    return out
+
+
+def binding_check(lines: list, cpus: list, threads: dict) -> dict:
+    """Each rank's Cpus_allowed_list against cpus (the first thread of each physical core): every rank on one
+    cpu of the list alone, no hyperthread, no two ranks on one cpu. threads (the cores' threads) only explain
+    a failure: a rank on a whole core shows both of its threads."""
+    want = {frozenset({c}) for c in cpus}
+    got = [frozenset(allowed_cpus(l.split(":", 1)[1])) for l in lines if l.startswith("Cpus_allowed_list:")]
+    bad = [sorted(g) for g in got if g not in want]
+    return {"ranks": len(got), "on_a_core_of_the_list": not bad, "distinct_cores": len(set(got)) == len(got),
+            "ok": len(got) == len(cpus) and not bad and len(set(got)) == len(got), "outside": bad[:4]}
+
+
+def mpi_local(args, cpus: list, logs: Path) -> dict:
+    """mpirun of the image on every physical core, REPEATS times: each rank's binding; then two halves of the
+    cores at once (disjoint --cpu-set); with --sdp, sdpb on the small SDP with every core (2 iterations)."""
+    from . import execute
+    site = execute.Site(name="probe", sif=args.sif, binds=[str(logs.resolve())], generator="", scratch="", runs="",
+                        pmp2sdp="", dynamical_sdp="", driver_reserve_mb=0, bench_dir=Path("."))
+    env = {**execute.local_env(), **MPI_ENV, "UCX_TLS": "self,sm"}
+    threads = core_threads()
+    show = ["sh", "-c", "grep Cpus_allowed_list /proc/self/status"]
+    out = {"cpus": cpus, "full": [], "halves": []}
+    for rep in range(REPEATS):
+        log = logs / f"mpi-full-r{rep}.log"
+        rf = execute.write_rankfile(logs / f"mpi-full-r{rep}.rankfile", cpus)
+        r = limited(execute.local_argv(site, show, cpus, True, rf), STARTUP_LIMIT, log, env)
+        chk = binding_check(log.read_text(errors="replace").splitlines(), cpus, threads)
+        out["full"].append({**r, **chk, "ok": chk["ok"] and r["exit"] == 0})
+    half = len(cpus) // 2
+    for rep in range(REPEATS):
+        parts = [cpus[:half], cpus[half:2 * half]]
+        rfs = [execute.write_rankfile(logs / f"mpi-half{k}-r{rep}.rankfile", p) for k, p in enumerate(parts)]
+        procs = [subprocess.Popen(execute.local_argv(site, show, p, True, rf), stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, env=env, start_new_session=True) for p, rf in zip(parts, rfs)]
+        texts = [p.communicate(timeout=STARTUP_LIMIT)[0].decode(errors="replace") for p in procs]
+        for k, t in enumerate(texts):
+            (logs / f"mpi-half{k}-r{rep}.log").write_text(t)
+        checks = [binding_check(t.splitlines(), p, threads) for t, p in zip(texts, parts)]
+        out["halves"].append({"exit": [p.returncode for p in procs], "checks": checks,
+                              "ok": all(c["ok"] for c in checks) and all(p.returncode == 0 for p in procs)})
+    if args.sdp:
+        out["sdpb"] = []
+        for rep in range(REPEATS):
+            w = logs / f"sdpb-r{rep}"
+            w.mkdir(parents=True)
+            site.binds = [str(logs.resolve()), args.sdp, str(w.resolve())]
+            rf = execute.write_rankfile(logs / f"sdpb-r{rep}.rankfile", cpus)
+            cmd = execute.local_argv(site, ["sdpb_3.0sky", "--sdpDir", args.sdp, "--outDir", str(w / "out"),
+                                            "--checkpointDir", str(w / "ck"), "--precision", str(args.sdp_precision),
+                                            "--maxIterations", "2", "--verbosity", "1"], cpus, True, rf)
+            log = logs / f"sdpb-r{rep}.log"
+            r = limited(cmd, STARTUP_LIMIT, log, env)
+            out["sdpb"].append({**r, **count_errors(log.read_text(errors="replace"))})
+            shutil.rmtree(w, ignore_errors=True)
+    out["ok"] = all(x["ok"] for x in out["full"] + out["halves"]) and \
+        all(x["exit"] == 0 for x in out.get("sdpb", []))
+    return out
+
+
+def systemd_scope() -> dict:
+    """Can bootlab put a pmp2sdp instance in a systemd user scope with a memory limit (memory_guard =
+    systemd)? A scope with MemoryMax=64M whose own memory.max says so."""
+    if not shutil.which("systemd-run"):
+        return {"available": False, "why": "no systemd-run"}
+    r = run(["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=64M", "sh", "-c",
+             "cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max"])
+    ok = r["exit"] == 0 and r["out"].strip() == str(64 << 20)
+    return {"available": ok, "why": "a scope's memory.max is set" if ok else
+            f"exit {r['exit']}: {(r['out'] + r['err']).strip()[-300:]}"}
+
+
+def cmd_local(args):
+    """bootlab probe local: this machine, directly, no Slurm: the CPU and its physical
+    cores, the memory, the runs directory and the local disks (bootlab's file pattern), apptainer and the image,
+    mpirun of the image on every core (the bindings), whether a systemd user scope can bound the memory. Writes
+    <out>/node-<host>-local.json and <out>/probe.json for site gen (plan what = local)."""
+    from . import execute
+    out = Path(args.out)
+    logs = out / "local-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    args.shared = args.shared or execute.install_runs()
+    Path(args.shared).mkdir(parents=True, exist_ok=True)
+    host = socket.gethostname().split(".")[0]
+    mounts = parse_mountinfo(read("/proc/self/mountinfo", ""))
+    cpus = execute.physical_cpus(os.sched_getaffinity(0))
+    mem = {k: int(v.split()[0]) for k, v in (l.split(":", 1) for l in read("/proc/meminfo", "").splitlines())}
+    rec = {"format": FORMAT, "what": "node", "host": host, "job": "local", "start": now(), "timezone": timezone(),
+           "user": getpass.getuser(), "cpu": cpu(), "physical_cpus": cpus,
+           "memory_mb": {k: mem[k] // 1024 for k in ("MemTotal", "MemAvailable", "SwapTotal") if k in mem},
+           "nics": nics()}
+    rec["shared"] = shared_fs(args.shared, mounts, rec["nics"])
+    rec["shared"]["hardlink"] = hardlink(args.shared)
+    rec["local_extra"] = args.local
+    rec["local"] = local_candidates(mounts, rec["shared"].get("dev"), args.local)
+    setup = apptainer_setup()
+    rec["apptainer"] = find_apptainer(setup)
+    rec["image"] = image(args.sif, rec["apptainer"].get("setup") or "") if rec["apptainer"]["how"] else None
+    rec["mpi"] = mpi_local(args, cpus, logs)
+    rec["memory_guard"] = systemd_scope()
+    rec["throughput"] = {}
+    done = set()
+    for c in rec["local"]:
+        key = (c["block"] or {}).get("device")
+        if not (c["local_block_device"] and c["writable"] and not c["same_device_as_shared"]) or key in done:
+            continue
+        if (c["free_gb"] or 0) < MIN_FREE_GB:
+            c["not_measured"] = f"free {c['free_gb']} GB < {MIN_FREE_GB}"
+            continue
+        done.add(key)
+        rec["throughput"][c["path"]] = throughput(c["path"], "local")
+    rec["throughput"]["shared"] = throughput(args.shared, "shared")
+    rec["ib"] = {"start": [], "end": [], "chosen": None}
+    rec["end"] = now()
+    (out / f"node-{host}-local.json").write_text(json.dumps(rec, indent=1) + "\n")
+    plan = {"format": FORMAT, "what": "local", "time": rec["start"], "host": host, "user": rec["user"],
+            "sif": args.sif, "shared": args.shared, "shared_where": where(args.shared, mounts),
+            "apptainer_setup": setup}
+    probe = {"format": FORMAT, "created": now(), "plan": plan, "nodes": {host: [rec]}, "pairs": [],
+             "types": {"local": {"hosts": [host], "physical_cores": len(cpus),
+                                 "mem_mb": rec["memory_mb"]["MemTotal"]}}}
+    (out / "probe.json").write_text(json.dumps(probe, indent=1) + "\n")
+    m = rec["mpi"]
+    print(f"{host}: {len(cpus)} physical cores, {rec['memory_mb']} MB; mpirun on every core "
+          f"{'ok' if m['ok'] else 'FAILED'}; systemd scope {'yes' if rec['memory_guard']['available'] else 'no'}")
+    print(out / "probe.json")
+
+
 # ---------------------------------------------------------------------------------------------- pair
 
 def limited(cmd: list, seconds: int, log: Path, env: dict = None) -> dict:
@@ -1116,6 +1275,8 @@ def main(argv=None):
     p.add_argument("--submit", action="store_true")
     p.add_argument("--what", choices=["node", "pair"], default="node")
     p.add_argument("--types", help="only these node types (comma separated)")
+    p.add_argument("--partition", help="only this Slurm partition's nodes; the probe jobs go to it")
+    p.add_argument("--node", help="a node probe on this node (its type only); the job waits when it is busy")
     p.add_argument("--sdp", help="pair: a small SDP for the start-up test")
     p.add_argument("--sdp-precision", type=int, default=785)
     p.add_argument("--local", action="append", default=[],
@@ -1140,6 +1301,14 @@ def main(argv=None):
     p.add_argument("--local", action="append", default=[],
                    help="a directory to try as node-local scratch besides the usual ones (repeatable)")
     p.set_defaults(fn=cmd_pair)
+    p = sub.add_parser("local", help="a machine without Slurm: probe it here (no job)")
+    p.add_argument("--sif", required=True)
+    p.add_argument("--shared", help="the runs directory (default: the installation's, execute.install_runs)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--local", action="append", default=[], help="a scratch directory to try (repeatable)")
+    p.add_argument("--sdp", help="a small SDP: sdpb with every core, besides the bindings")
+    p.add_argument("--sdp-precision", type=int, default=785)
+    p.set_defaults(fn=cmd_local)
     p = sub.add_parser("io", help="pair's part on one node (internal)")
     p.add_argument("--op", choices=["write", "read"], required=True)
     p.add_argument("--dir", required=True)

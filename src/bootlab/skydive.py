@@ -13,7 +13,7 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from . import bench, execute, inputs, pmp
+from . import bench, execute, inputs, pmp, precision
 from .numbers import decimal_text, frac
 
 # The options of dynamical_sdp that bt r3.8 passes when the parameter file leaves them out: upstream's
@@ -213,7 +213,8 @@ class Run:
         seconds["pmp"] = round(time.time() - t, 1)
 
         t = time.time()
-        sdps = self.build_sdps(n, lists, sdir / "sdp", logs)
+        bits = state["precision"]
+        sdps = self.build_sdps(n, lists, sdir / "sdp", logs, bits)
         seconds["sdp"] = round(time.time() - t, 1)
         if self.node.others:         # pmp2sdp ran on node 0; every node reads the SDPs from its own disk (a shared
                                      # scratch: from node 0's, nothing to copy)
@@ -231,8 +232,10 @@ class Run:
 
         t = time.time()
         nmax = (self.p.numerics["lambda"] + 1) // 2
-        solver = {"precision": self.p.solver_precision(), **solver_defaults(nmax),
-                  "maxRuntime": execute.job_seconds_left() - 900, **self.p.run.get("solver", {}),
+        self.raise_checkpoint(bits)
+        solver = {"precision": bits, **solver_defaults(nmax),
+                  **({"maxRuntime": execute.job_seconds_left() - 900} if self.node.launcher != "local" else {}),
+                  **self.p.run.get("solver", {}),
                   "dualityGapThreshold": state["gap_threshold"]}
         dynamical = {**DYNAMICAL_DEFAULTS, **self.p.run.get("dynamical", {}),
                      "externalParamInfinitestimal": self.opts.get("infinitesimal", inputs.INFINITESIMAL)}
@@ -241,45 +244,74 @@ class Run:
                                          [sdps[f"plus_{i}"] for i in range(len(self.p.coords))],
                                          out, self.ck, solver, dynamical, state, logs / "dynamical_sdp")
         seconds["dive"] = round(time.time() - t, 1)
-        dive = execute.read_dive(out, code)
+        dive = execute.read_dive(out, code, (logs / "dynamical_sdp").with_suffix(".out"))
         for f in ("out.txt", "skydiving_out.txt"):
             if (out / f).exists():
                 shutil.copy(out / f, logs / f)
-        done = self.keep_generation(procs)
+        done = self.keep_generation(procs, bits)
         if done:
             seconds["checkpoint"] = done["seconds"]
         return dive, procs, seconds, sdir, lists["c"]
 
-    def keep_generation(self, procs):
+    def keep_generation(self, procs, bits):
         """The generation the call ended with, kept for its record (execute.keep_generation): a job killed
-        later, while the solver saves again, resumes from it (docs/en/interfaces.md section 11)."""
+        later, while the solver saves again, resumes from it (docs/en/interfaces.md section 11). Its layout.json has the call's
+        precision: the binary checkpoint is of that precision."""
         return execute.keep_generation(self.ck, self.records() + 1, {"nodes": self.node.all_hosts,
-                                                                    "node_type": self.node.node_type, "ppn": procs})
+                                                                    "node_type": self.node.node_type, "ppn": procs,
+                                                                    "precision": bits})
 
-    def build_sdps(self, n: int, lists: dict, sdp_root: Path, logs: Path) -> dict:
+    def checkpoint_kept(self):
+        """(layout.json, precision) of the checkpoint the next call loads: the generation kept for the last record
+        (or one restored from it); its precision from layout.json, the problem's when it has none (kept before
+        mixed precision). None without a checkpoint (a cold start)."""
+        kept = execute.kept_for(self.ck, self.records())
+        if kept is None or not (self.ck / "checkpoint.json").exists():
+            return None
+        lay = json.loads((kept / "layout.json").read_text())
+        return lay, lay.get("precision", self.p.solver_precision())
+
+    def raise_checkpoint(self, bits: int):
+        """Before a call at `bits`: its checkpoint converted when kept at a lower precision (never higher: the
+        call's precision is at least the checkpoint's, loop)."""
+        kept = self.checkpoint_kept()
+        if kept is None or kept[1] == bits:
+            return
+        lay, have = kept
+        t = time.time()
+        g = precision.convert_checkpoint(self.ck, lay, have, bits)
+        self.log(f"checkpoint generation {lay['generation']} from {have} to {bits} bits as generation {g}, "
+                 f"{round(time.time() - t, 1)} s")
+
+    def build_sdps(self, n: int, lists: dict, sdp_root: Path, logs: Path, prec: int) -> dict:
         """pmp2sdp for the step's PMPs, as many at a time as the node's memory holds (docs/en/interfaces.md section 9).
 
         The run's first step, or the first after a resume on another node type or with other processes,
         converts the central point's SDP alone and measures it: its held memory (execute.build_sdps) is the
         peak, and k = bench.pmp2sdp_at_once of it; the other points follow k at a time. Later steps convert k
         at a time without measuring. self.sdp_mem keeps the node type, the processes, the peak, k and the step
-        it was measured at; solves.jsonl records it with each step and a resume takes it from there."""
+        it was measured at, and the precision (a mixed precision run measures again when it rises; a record
+        without one: the problem's); solves.jsonl records it with each step and a resume takes it from there."""
         per = bench.pmp2sdp_procs(self.node.cores, len(lists))
         mem = self.node.mem_mb - self.site.driver_reserve_mb
-        prec = self.p.solver_precision()
         m = self.sdp_mem
-        if m and (m["node_type"], m["procs"]) == (self.node.node_type, per):
+        if m and (m["node_type"], m["procs"], m.get("precision", self.p.solver_precision())) == \
+                (self.node.node_type, per, prec):
             at_once = min(m["k"], len(lists))
             self.log(f"step {n}: pmp2sdp {len(lists)} SDPs, {at_once} at a time with {per} processes each "
                      f"(k = {m['k']}: {m['peak_mb']} MB an instance, measured at step {m['measured_at_step']})")
             return execute.build_sdps(self.site, self.node, lists, sdp_root, prec, logs, at_once, per)[0]
         self.log(f"step {n}: pmp2sdp the central point's SDP alone with {per} processes, to measure its memory")
         sdps, (w,) = execute.build_sdps(self.site, self.node, {"c": lists["c"]}, sdp_root, prec, logs, 1, per)
+        if w.get("measure"):         # local mode: what the watchdog read
+            self.log(f"step {n}: pmp2sdp's memory measured as {w['measure']}"
+                     + (": no smaps_rollup here, RssAnon leaves the shared memory out" if w["measure"] == "rss_anon"
+                        else ""))
         if w.get("watchdog") is False:
             self.log(f"step {n}: the steps' cgroups cannot be read here: no memory watchdog for pmp2sdp, and its "
                      f"memory is the node's MemTotal - MemAvailable rise")
         k = bench.pmp2sdp_at_once(mem, w["held_mb"])
-        self.sdp_mem = {"node_type": self.node.node_type, "procs": per, "peak_mb": w["held_mb"], "k": k,
+        self.sdp_mem = {"node_type": self.node.node_type, "procs": per, "precision": prec, "peak_mb": w["held_mb"], "k": k,
                         "measured_at_step": n, "cgroup_peak_mb": w["cgroup_peak_mb"], "node_mb": w["node_mb"]}
         self.log(f"step {n}: the SDP held {w['held_mb']} MB that --mem pressure cannot reclaim (memory.peak "
                  f"{w['cgroup_peak_mb']} MB, the node's MemTotal - MemAvailable +{w['node_mb']} MB); {mem} MB / "
@@ -308,6 +340,8 @@ class Run:
         box_max = [frac(v) for v in o["box_max"]]
         direction = [str(v) for v in o.get("find_boundary_direction", [])]
         guess = o.get("hessian_guess", [])
+        mixed = o.get("mixed_precision", False)
+        full = self.p.solver_precision()
         while True:
             if n >= o["max_steps"]:
                 self.keep_checkpoint()
@@ -329,28 +363,43 @@ class Run:
                 "hessian_guess": [str(guess[i]) if i == j else "0" for i in range(k) for j in range(k)] if guess else None,
                 "gap_threshold": gap_threshold(threshold, None if first else bfgs.get("prev_navigator"),
                                                o.get("gap_threshold_tighten", True)),
+                "precision": max((bfgs.get("precision") or precision.choose(full, o["gap_upper_limit"]))
+                                 if mixed else full, (self.checkpoint_kept() or (None, 0))[1]),
             }
             self.log(f"step {n + 1} at {[x[c] for c in self.p.coords]}: gap upper limit {state['gap_upper_limit']}, "
-                     f"gap threshold {state['gap_threshold']}, boundary {'on' if state['boundary_direction'] else 'off'}")
+                     f"gap threshold {state['gap_threshold']}, boundary {'on' if state['boundary_direction'] else 'off'}, "
+                     f"{state['precision']} bits")
             try:
                 dive, procs, seconds, sdir, center_pmp = self.step(n + 1, x, state, procs)
             except execute.StepFailed as e:
                 self.record({"step": n + 1, "x": [x[c] for c in self.p.coords], "verdict": "aborted",
                              "reason": f"failed: {e}", "procs": procs, **self.where(),
-                             "pmp2sdp": self.sdp_mem})
+                             "pmp2sdp": self.sdp_mem, "precision": state["precision"]})
                 return self.finish("failed", f"failed: {e}", x, n)
+            iterations, unknown = record_iterations(dive, state["total_iterations"])
             line = {"step": n + 1, "x": [x[c] for c in self.p.coords], "verdict": dive.verdict, "reason": dive.reason,
                     "navigator": dive.navigator, "primal": dive.primal, "dual": dive.dual, "gap": dive.gap,
                     "ext_step": dive.ext_step, "gradient": dive.gradient, "hessian": dive.hessian,
-                    "iterations": dive.iterations, "alpha_p": dive.alpha_p, "alpha_d": dive.alpha_d, "beta": dive.beta,
+                    "iterations": iterations, **({"iterations_unknown": unknown} if unknown else {}),
+                    "alpha_p": dive.alpha_p, "alpha_d": dive.alpha_d, "beta": dive.beta,
                     "climbed": dive.climbed, "find_minimum": dive.find_minimum,
                     "gap_upper_limit": state["gap_upper_limit"], "gap_threshold": state["gap_threshold"],
                     "boundary_on": bool(state["boundary_direction"]),
-                    "procs": procs, **self.where(), "seconds": seconds, "pmp2sdp": self.sdp_mem}
+                    "procs": procs, **self.where(), "seconds": seconds, "pmp2sdp": self.sdp_mem,
+                    "precision": state["precision"]}
+            if mixed:
+                line.update(self.precision_fields(line, dive, state, full))
             self.record(line)
             if dive.verdict == "aborted":
                 self.keep_checkpoint()
                 return self.finish("unfinished", dive.reason, x, n)
+            if dive.verdict == "optimal" and line["precision"] < full:
+                # the run's end is decided at full precision: the same point, the same BFGS state, once more
+                (self.dir / "steps" / str(n + 1)).rename(self.dir / "steps" / f"{n + 1}-{line['precision']}bits")
+                shutil.rmtree(sdir, ignore_errors=True)
+                execute.on_hosts(self.site, self.node, f"rm -rf {sdir}", self.node.others)
+                bfgs = {**bfgs, "first_call": False, "total_iterations": dive.iterations, "precision": full}
+                continue
             if dive.verdict == "optimal":
                 status, reason = optimal_ending(dive.primal, dive.dual, bool(state["boundary_direction"]))
                 if status == "converged":
@@ -371,10 +420,27 @@ class Run:
             boundary_on = boundary_on or bool(direction and negative)
             bfgs = {"total_iterations": dive.iterations, "prev_step": dive.ext_step,
                     "prev_gradient": dive.gradient, "prev_hessian": [h for row in dive.hessian for h in row],
-                    "prev_navigator": dive.navigator, "first_navigator": bfgs.get("first_navigator", dive.navigator)}
+                    "prev_navigator": dive.navigator, "first_navigator": bfgs.get("first_navigator", dive.navigator),
+                    "precision": line.get("precision_next")}
             shutil.rmtree(sdir, ignore_errors=True)
             execute.on_hosts(self.site, self.node, f"rm -rf {sdir}", self.node.others)
             x, n = x_next, n + 1
+
+    def precision_fields(self, line: dict, dive, state: dict, full: int) -> dict:
+        """A mixed precision record's call_iterations (None when unknown), first_call (a cold start; left out
+        when not), precision_next and precision_note (why it is not this call's; left out when it is)."""
+        f = {"call_iterations": dive.iterations - state["total_iterations"] if dive.iterations is not None
+             else dive.call_iterations}
+        if state.get("first_call"):
+            f["first_call"] = True
+        sj = self.dir / "solves.jsonl"
+        history = [json.loads(l) for l in sj.read_text().splitlines() if l.strip()] if sj.exists() else []
+        nxt, note = precision.next_precision({**line, **f}, history, full)
+        f["precision_next"] = nxt
+        if note:
+            f["precision_note"] = note
+            self.log(f"step {line['step']}: precision: {note}")
+        return f
 
     def keep_checkpoint(self):
         """The solver's checkpoint, for a resume to start hot (docs/en/interfaces.md section 11): the run's checkpoint/,
@@ -411,6 +477,29 @@ def start_state(problem) -> dict:
     return {"x": x, "n": 0, "bfgs": {"total_iterations": 0, "first_call": True}, "boundary_on": False, "procs": None}
 
 
+def record_iterations(dive, before: int) -> tuple:
+    """(iterations, why unknown) of a call's record: the solver's cumulative count; for an aborted call the count
+    before it plus the iterations it made (its stdout), so the records count every call and a run stopped and
+    resumed counts as one that was not; (None, why) when the solver's output has no iteration table."""
+    if dive.verdict != "aborted":
+        return dive.iterations, None
+    if dive.call_iterations is None:
+        return None, "no iteration table in the solver's output: this call's iterations are not counted"
+    return before + dive.call_iterations, None
+
+
+def resume_iterations(lines: list) -> tuple:
+    """(total, warning) for a resume: the cumulative count of the last record that has one (aborted calls
+    count, record_iterations); a last aborted record with its iterations unknown is passed, with a warning."""
+    counted = [l for l in lines if l.get("iterations") is not None]
+    total = counted[-1]["iterations"] if counted else 0
+    last = lines[-1]
+    if last.get("iterations_unknown"):
+        return total, (f"the last call's iterations are unknown ({last['iterations_unknown']}): the cumulative "
+                       f"count goes on from {total}, without that call's")
+    return total, None
+
+
 def resume_state(problem, run_dir: Path, hot: bool) -> dict:
     """Where a run left off, from its last record: after a step, the next point with that step's BFGS
     state; after an aborted step, the same point with the state of the step before it. hot: the solver
@@ -429,12 +518,14 @@ def resume_state(problem, run_dir: Path, hot: bool) -> dict:
     else:
         x = dict(zip(problem.coords, last["x"]))
         ref, n = (stepped[-1] if stepped else None), last["step"] - 1
-    bfgs = {"total_iterations": 0, "first_call": not hot}
+    total, warning = resume_iterations(lines)
+    bfgs = {"total_iterations": total, "first_call": not hot}
     if ref:
-        bfgs.update({"total_iterations": ref["iterations"], "prev_step": ref["ext_step"],
+        bfgs.update({"prev_step": ref["ext_step"],
                      "prev_gradient": ref["gradient"], "prev_hessian": [h for row in ref["hessian"] for h in row],
                      "prev_navigator": ref["navigator"],
                      "first_navigator": stepped[0]["navigator"]})    # N_1, for gap_upper_limit_track
+    bfgs["precision"] = next((l["precision_next"] for l in reversed(lines) if "precision_next" in l), None)
     sdp_mem = next((l["pmp2sdp"] for l in reversed(lines) if l.get("pmp2sdp")), None)
     return {"x": x, "n": n, "bfgs": bfgs, "boundary_on": boundary_on, "procs": last.get("procs"),
-            "pmp2sdp": sdp_mem}
+            "pmp2sdp": sdp_mem, "warnings": [warning] if warning else []}

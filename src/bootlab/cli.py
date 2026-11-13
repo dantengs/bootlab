@@ -1,5 +1,9 @@
-"""bootlab run <run.toml> | resume <run dir> | submit [--resume] [--dry] <run.toml | run dir> | summary <run dir>
-| regress [--node <host>] [--dry] | probe ... | site ....
+"""bootlab run <run.toml> | resume <run dir> | submit [--resume] [--dry] [--systemd] <run.toml | run dir> | summary
+<run dir> | stop <run dir> | bench <run.toml> [--node <host>] | regress [--node <host>] [--dry] [--wait] | probe ... |
+site ....
+
+Without Slurm (launcher local, execute.site_launcher) submit starts the driver in the background on this machine
+and stop ends it (README: a workstation without Slurm).
 
 run and resume work inside a Slurm allocation (sites/<site>/run.sbatch) of one node, or of several of one type
 for the solver (run.toml [resources]); submit, on the login node, chooses the nodes and calls sbatch; summary
@@ -8,15 +12,19 @@ works anywhere.
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
 
-from . import bench, execute, inputs, layout, probe, regress, sitegen, skydive
+from . import bench, benchrun, execute, inputs, layout, probe, regress, sitegen, skydive
 
 
 def _new_run_dir(problem, site) -> Path:
@@ -47,7 +55,9 @@ def here(problem, site) -> execute.Node:
     """This job's nodes, checked against run.toml [resources] and the site before anything runs; the site's
     environment applied to the driver's first, so every step inherits it."""
     execute.apply_env(site)
-    node = execute.Node.here(site.node_types)
+    launcher, why = execute.site_launcher(site)
+    node = execute.Node.here(site.node_types, launcher, site.mem_gb)
+    node.launcher_why = why
     mn = layout.multinode_of({"multinode": site.multinode}) if site.multinode else None
     layout.check_allocation(node.all_hosts, problem.run.get("resources", {}), site.node_types, mn)
     return node
@@ -84,7 +94,11 @@ def make_run(problem, site, node, run_dir: Path):
 def start_lines(problem, site, run_site, node) -> list:
     """driver.log at a run's or a resume's start: the multinode rule, each node's MPI device, each node's route to
     the runs file system, and how the copies reach each node."""
-    return (multinode_note(problem, site) + execute.net_report(run_site, node) + execute.runs_network(run_site, node)
+    local = [f"physical cores {node.cores} (cpus {','.join(map(str, node.cpus))}), memory {node.mem_mb} MB "
+             f"available at the start" + (f" (at most the site's mem_gb {site.mem_gb})" if site.mem_gb else "")] \
+        if node.launcher == "local" else []
+    return ([f"launcher {node.launcher}: {node.launcher_why}"] + local
+            + multinode_note(problem, site) + execute.net_report(run_site, node) + execute.runs_network(run_site, node)
             + execute.copy_report(run_site, node) + execute.runs_measured_note(run_site))
 
 
@@ -99,7 +113,11 @@ def cmd_run(args):
     problem = inputs.load(args.run_toml)
     site = execute.load_site(execute.site_name(problem.run.get("exec", {})))
     node = here(problem, site)
+    if node.launcher == "local":
+        execute.local_lock(Path(site.runs), f"run {args.run_toml}")
     run_dir = _new_run_dir(problem, site)
+    if node.launcher == "local":
+        execute.write_driver_pid(run_dir)
     problem = inputs.load(run_dir / "run.toml")
     r = make_run(problem, site, node, run_dir)
     r.log(f"run {run_dir.name} on {where(node)}")
@@ -126,9 +144,19 @@ def cmd_resume(args):
     problem = inputs.load(run_dir / "run.toml")
     site = execute.load_site(execute.site_name(problem.run.get("exec", {})))
     node = here(problem, site)
+    if node.launcher == "local":
+        old = run_dir / "driver.pid"
+        if old.exists():
+            d = json.loads(old.read_text())
+            if d.get("host") == node.host and d["pgid"] != os.getpgid(0) and execute.group_alive(d["pgid"]):
+                raise SystemExit(f"{run_dir}: its driver (process group {d['pgid']}) still runs: bin/bootlab stop first")
+        execute.local_lock(Path(site.runs), f"resume {run_dir}")
+        execute.write_driver_pid(run_dir)
     r = make_run(problem, site, node, run_dir)
     hot = place_checkpoint(r, run_dir, last_record(run_dir).get("procs"))   # resume_state's procs
     s = skydive.resume_state(problem, run_dir, hot)
+    for w in s.get("warnings", []):
+        r.log(f"warning: {w}")
     if not hot:
         r.log("resume: cold start: its first solver call gets the gap upper limit (keep it at 1e-12 or below)")
         last = last_record(run_dir)
@@ -230,7 +258,13 @@ def cmd_submit(args, what: str = None, time_limit: str = None):
         problem = inputs.load(run_dir / "run.toml")
     else:
         problem = inputs.load(args.target)
+    if getattr(args, "nodes", None):          # bootlab bench --node: that node, whatever run.toml says
+        problem.run["resources"] = {"nodes": args.nodes}
     site = execute.load_site(execute.site_name(problem.run.get("exec", {})))
+    launcher, why = execute.site_launcher(site)
+    if launcher == "local":
+        return local_submit(site, what or ("resume" if args.resume else "run"), Path(args.target).resolve(),
+                            args.dry, getattr(args, "systemd", False), why)
     mn = layout.multinode_of({"multinode": site.multinode}) if site.multinode else \
         layout.Multinode(prefer=list(site.node_types), peers=[], max_nodes=1, min_efficiency=1.0, min_gain=1.0,
                          allowed=False, basis="the site has no [multinode]")
@@ -253,6 +287,46 @@ def cmd_submit(args, what: str = None, time_limit: str = None):
         subprocess.run(cmd, check=True)
 
 
+def cmd_bench(args):
+    """bootlab bench <run.toml> [--node <host>] [--time] [--dry] (login node): one job of one whole node runs
+    `bench run`, which measures the solver on the run's problem (benchrun) and adds the rows to the site's
+    bench file of that node type."""
+    if len(args.words) > 2 or (len(args.words) == 2 and args.words[0] != "run"):
+        raise SystemExit("bootlab bench <run.toml> [--node <host>] | bench run <run.toml>")
+    args.action, args.target = ("run", args.words[1]) if len(args.words) == 2 else ("submit", args.words[0])
+    if args.action == "submit":
+        return cmd_submit(argparse.Namespace(target=args.target, resume=False, dry=args.dry, systemd=False,
+                                             nodes=[args.node] if args.node else None),
+                          what="bench run", time_limit=args.time)
+    problem = inputs.load(args.target)
+    site = execute.load_site(execute.site_name(problem.run.get("exec", {})))
+    node = here(problem, site)
+    if node.launcher == "local":
+        execute.local_lock(Path(site.runs), f"bench {args.target}")
+    work = Path(site.runs) / f"bench-{problem.run['name']}-{time.strftime('%Y%m%d-%H%M%S')}"
+    work.mkdir(parents=True)
+    scratch, _, notes = execute.choose_scratch(site, node, work)
+    site = execute.with_binds(site, [scratch, work])
+
+    def log(msg):
+        line = f"{execute.now()} {msg}"
+        print(line, flush=True)
+        with open(work / "bench.log", "a") as f:
+            f.write(line + "\n")
+    for n in notes:
+        log(n)
+    log(f"bench of {problem.model['name']} Lambda {problem.numerics['lambda']} on {node.host} "
+        f"({node.node_type}, {node.cores} physical cores)")
+    try:
+        rows = benchrun.measure(problem, site, node, work, Path(scratch), log)
+    finally:
+        execute.clear(site, node, Path(scratch))
+    if not rows:
+        raise SystemExit(f"bench: no solver row measured (see {work})")
+    path = benchrun.append_rows(site.bench_dir, node.node_type, node.cores, rows)
+    log(f"{len(rows)} solver rows added to {path}")
+
+
 def cmd_regress(args):
     """bootlab regress: on the login node, the regression's inputs (examples/ising, three
     steps) in <runs>/regress-input-<time>/ and a job of one whole node that runs them and checks them against
@@ -268,8 +342,80 @@ def cmd_regress(args):
     run_toml = regress.input_dir(Path(site.runs) / f"regress-input-{time.strftime('%Y%m%d-%H%M%S')}", args.site,
                                  args.node and [args.node])
     print(f"# inputs {run_toml.parent}")
+    if args.wait:              # local mode: run it here and print PASS or FAIL
+        if execute.site_launcher(site)[0] != "local":
+            raise SystemExit("--wait is for local mode (on a cluster the job runs it)")
+        return cmd_regress(argparse.Namespace(action="run", target=str(run_toml)))
     cmd_submit(argparse.Namespace(target=str(run_toml), resume=False, dry=args.dry), what="regress run",
                time_limit=args.time)
+
+
+BOOT = "import sys; sys.path.insert(0, sys.argv.pop(1)); from bootlab.cli import main; main(sys.argv[1:])"
+
+
+def local_submit(site, what: str, target: Path, dry: bool, systemd: bool, why: str):
+    """bootlab submit on a machine without Slurm: the driver started in the background in
+    a session of its own (setsid; its process group is what bootlab stop reaches), output to
+    <runs>/local-<what>-<time>.log; with systemd, as a transient user unit (it outlives the login only with
+    loginctl enable-linger; some systems end a session's processes at logout, KillUserProcesses)."""
+    runs = Path(site.runs)
+    runs.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log = runs / f"local-{what.replace(' ', '-')}-{stamp}.log"
+    cmd = [site.python or sys.executable, "-I", "-c", BOOT, str(execute.REPO / "src"), *what.split(), str(target)]
+    if systemd:
+        keep = {k: v for k, v in os.environ.items()
+                if k in ("PATH", "HOME", "USER", "LANG", "MODULEPATH", "BOOTLAB_RUNS") or k.startswith("APPTAINER")}
+        cmd = (["systemd-run", "--user", "--quiet", "--collect", "--unit", f"bootlab-{stamp}",
+                "-p", f"WorkingDirectory={os.getcwd()}", "-p", f"StandardOutput=append:{log}",
+                "-p", f"StandardError=append:{log}"] + [a for k, v in keep.items() for a in ("--setenv", f"{k}={v}")]
+               + cmd)
+    print(f"# launcher local: {why}")
+    print(" ".join(shlex.quote(c) for c in cmd))
+    if dry:
+        return
+    held = execute.lock_holder(runs)
+    if held:
+        raise SystemExit(f"another local run is going: {held}")
+    if systemd:
+        subprocess.run(cmd, check=True)
+        print(f"started as the user unit bootlab-{stamp}; log {log}")
+        return
+    with open(log, "ab") as out:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    print(f"started: process group {p.pid}, log {log}; bin/bootlab stop <run dir> ends it")
+
+
+def cmd_stop(args):
+    """bootlab stop <run dir> (local mode): while the solver runs, SIGTERM to its ranks only, which write the
+    checkpoint and end the call ("SIGTERM signal received"), so the driver records the step as unfinished and
+    ends (mpirun given a SIGTERM would SIGKILL the ranks a few seconds later); before that, SIGTERM to the
+    driver's process group (the step is done again from the last checkpoint on resume). Waits up to --wait
+    seconds for the driver's group to end."""
+    run_dir = Path(args.run_dir).resolve()
+    d = json.loads((run_dir / "driver.pid").read_text())
+    host = socket.gethostname().split(".")[0]
+    if d["host"] != host:
+        raise SystemExit(f"{run_dir}: its driver runs on {d['host']}, this is {host}")
+    if not execute.group_alive(d["pgid"]):
+        print(f"{run_dir}: no driver runs (process group {d['pgid']})")
+        return
+    problem = inputs.load(run_dir / "run.toml")
+    site = execute.load_site(execute.site_name(problem.run.get("exec", {})))
+    ranks = execute.solver_ranks(d["pid"], site.dynamical_sdp)
+    if ranks:
+        for p in ranks:
+            os.kill(p, signal.SIGTERM)
+        print(f"SIGTERM to the solver's {len(ranks)} ranks: they write the checkpoint and end the call")
+    else:
+        os.killpg(d["pgid"], signal.SIGTERM)
+        print(f"SIGTERM to the driver's process group {d['pgid']} (no solver running)")
+    t = time.time() + args.wait
+    while time.time() < t and execute.group_alive(d["pgid"]):
+        time.sleep(1)
+    print(f"{run_dir}: " + ("still running after the wait" if execute.group_alive(d["pgid"]) else "stopped;"
+                            " bin/bootlab submit --resume continues it"))
 
 
 def short(v, digits=8):
@@ -323,10 +469,23 @@ def main(argv=None):
     p.add_argument("target", help="run.toml, or with --resume the run directory")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--dry", action="store_true", help="print the sbatch command only")
+    p.add_argument("--systemd", action="store_true", help="local mode: start the driver as a transient user unit")
     p.set_defaults(fn=cmd_submit)
+    p = sub.add_parser("stop", help="local mode: end a run (its solver writes the checkpoint)")
+    p.add_argument("run_dir")
+    p.add_argument("--wait", type=int, default=600, help="seconds to wait for the driver to end")
+    p.set_defaults(fn=cmd_stop)
     p = sub.add_parser("summary")
     p.add_argument("run_dir")
     p.set_defaults(fn=lambda a: write_summary(a.run_dir))
+    p = sub.add_parser("bench", help="measure the solver on a run's problem on one node: bin/bootlab bench "
+                                     "<run.toml> [--node H] (login node) | run <run.toml> (in the job)")
+    p.add_argument("words", nargs="+", metavar="[run] run.toml",
+                   help="the run.toml whose problem (model, Lambda, start point) is measured; run: in the job")
+    p.add_argument("--node", help="the node to measure (default: where Slurm puts the job); waits when busy")
+    p.add_argument("--time", default="02:00:00", help="the job's time limit")
+    p.add_argument("--dry", action="store_true", help="print the sbatch command only")
+    p.set_defaults(fn=cmd_bench)
     p = sub.add_parser("regress", help="Ising Lambda 11, three steps, against bt r3.8: bin/bootlab regress "
                                        "[submit] (login node) | run (in the job) | check <run dir>")
     p.add_argument("action", nargs="?", default="submit", choices=["submit", "run", "check"])
@@ -335,6 +494,7 @@ def main(argv=None):
     p.add_argument("--node", help="the node to run on (default: where Slurm puts the job)")
     p.add_argument("--time", default="01:00:00", help="the job's time limit")
     p.add_argument("--dry", action="store_true", help="print the sbatch command only")
+    p.add_argument("--wait", action="store_true", help="local mode: run here and wait for PASS or FAIL")
     p.set_defaults(fn=cmd_regress)
     p = sub.add_parser("probe", help="the cluster probe: plan | node | merge (bootlab.probe)", add_help=False)
     p.add_argument("rest", nargs=argparse.REMAINDER)

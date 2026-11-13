@@ -245,6 +245,10 @@ def check_run_numbers(run, coords) -> list:
         errors.append(f"run.toml [skydive] gap_threshold_tighten = {o['gap_threshold_tighten']!r} is not true or false: "
                       "false keeps [solver] dualityGapThreshold at every step, true (the default) tightens it with N "
                       "(docs/en/interfaces.md 10)")
+    if not isinstance(o.get("mixed_precision", False), bool):
+        errors.append(f"run.toml [skydive] mixed_precision = {o['mixed_precision']!r} is not true or false: true runs "
+                      "the solver and pmp2sdp at the lowest precision that keeps enough digits and ends the run at "
+                      "the problem's own (precision.py); false (the default) keeps the problem's at every call")
     eps = o.get("infinitesimal")
     if isinstance(eps, (int, str)) and _exact(eps) and frac(eps) < frac(INFINITESIMAL_MIN):
         errors.append(f"run.toml [skydive] infinitesimal {eps} is below {INFINITESIMAL_MIN}: the generator keys and "

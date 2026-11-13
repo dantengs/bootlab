@@ -70,6 +70,8 @@ automatically. A run is resumed by hand from the last kept solver checkpoint.
 - One solve on several nodes needs InfiniBand; with Ethernet TCP only, bootlab stays on one node by default
   ([interfaces](docs/en/interfaces.md#multi-node-solves)).
 
+Or one Linux workstation without Slurm, with Apptainer and the image ([local mode](#a-workstation-without-slurm-local-mode)).
+
 No Python is needed on the host.
 
 ## Quick start
@@ -95,6 +97,49 @@ bin/bootlab submit examples/ising/run.toml # a run
 
 The [tutorial](docs/en/tutorial.md) goes through every step with its expected output.
 
+### A workstation without Slurm (local mode)
+
+bootlab also runs on one Linux machine without Slurm: the image's programs start with `apptainer exec`, the
+MPI ones through the image's own `mpirun`, one rank a physical core (never a core's second hardware thread),
+and the memory is what the machine has available when the run starts.
+
+Prerequisites:
+- Apptainer able to run without root: user namespaces enabled (most current distributions), or a setuid
+  installation.
+- `apptainer` on PATH. A workstation usually has no module system and needs nothing else; a cluster's
+  `module load apptainer` is not part of local mode.
+- No Slurm on the host: the generator asks for its node list through the image's own `scontrol` stand-in,
+  which answers with this machine's name.
+- The bootlab image on a local path.
+- Only one machine: no solve on several machines.
+- No Python needed on the host, as on a cluster.
+
+```bash
+./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <the image's sha256>
+bin/bootlab probe local --sif /path/to/bootlab-exec-r5.sif --out probe   # here, a few minutes: cores, memory,
+                                                                         # disks, mpirun on every core
+touch ws.hand.toml
+bin/bootlab site gen --probe probe/probe.json --hand ws.hand.toml --out sites/ws
+echo 'site = "ws"' >> bootlab.toml
+
+bin/bootlab regress --wait                 # here, in the foreground: PASS / FAIL
+bin/bootlab submit examples/ising/run.toml # in the background (setsid nohup); the log under runs/
+bin/bootlab stop runs/<run>                # the solver writes its checkpoint; later:
+bin/bootlab submit --resume runs/<run>
+```
+
+How bootlab chooses:
+- Without Slurm (no `SLURM_JOB_ID`, no `sbatch` on PATH) bootlab works locally. `launcher = "local"` or
+  `"slurm"` in the site or in bootlab.toml says it outright. `driver.log` records which one and why.
+- One local run at a time on a machine (a lock in the runs directory).
+- The `pmp2sdp` memory watchdog reads each instance's processes (`smaps_rollup`: Pss_Anon + Pss_Shmem), or,
+  with `memory_guard = "systemd"` (the probe sets it when it works), a systemd user scope with a memory limit.
+
+`submit --systemd` starts the driver as a transient systemd user unit. Background runs and logging out:
+- Some systems end every process of a session at logout (`KillUserProcesses=yes` in logind.conf), also those
+  started with nohup.
+- A user unit outlives the login only with `loginctl enable-linger`.
+
 ## Documentation
 
 | | English | 中文 |
@@ -113,8 +158,8 @@ fixed interfaces. The order is not fixed.
 - **Navigator** (minimising the navigator function with `sdpb` and `approx_objective`).
 - **Feasibility scans and bisection**, as Slurm job arrays of independent points.
 - **Delaunay region search, OPE scans, extremal functional (EFM) spectrum extraction.**
-- **`bootlab bench`**: one command that measures the resource choices (block tables, `pmp2sdp`, solver
-  processes) on a real point and writes them into the site's bench files.
+- **The rest of `bootlab bench`**: it measures the solver's processes on one node now; block tables,
+  `pmp2sdp` instances and several nodes are still to come.
 - **Spinning external operators** (current and stress-tensor bootstrap), with a second PMP generator that
   writes the same PMP format.
 
@@ -127,6 +172,9 @@ fixed interfaces. The order is not fixed.
   ([guide](docs/en/writing-models-with-ai.md)).
 - Developed and tested on one cluster (four node types, InfiniBand, NFS over IPoIB). The probe and the
   generated sites are meant for other clusters but have not been run on another one yet.
+- Local mode was accepted on a cluster's compute node with Slurm hidden, not on a machine that really has no
+  Slurm. Two of its options are untested beyond their unit tests: `memory_guard = "systemd"` (the pmp2sdp
+  watchdog through a systemd user scope) and `submit --systemd` (the driver as a systemd user unit).
 
 ## Acknowledgements
 

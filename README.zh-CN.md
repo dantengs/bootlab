@@ -55,6 +55,8 @@ Skydive 每一步算当前点 `x` 及其 `k` 个邻点 `x + ε eᵢ`，求解一
 - 可选：Slurm 配好的 cgroup v2（`pmp2sdp` 的内存看门狗要用；没有就关掉看门狗，并在 `driver.log` 里写明）。
 - 一个求解跨多台节点需要 InfiniBand；只有以太网 TCP 时默认只用一台（见[接口文档](docs/zh/interfaces.md#multi-node-solves)）。
 
+或者一台没有 Slurm 的 Linux 工作站，装有 Apptainer 和镜像（见[单机模式](#没有-slurm-的工作站单机模式)）。
+
 主机上不需要 Python。
 
 ## 快速开始
@@ -79,6 +81,43 @@ bin/bootlab submit examples/ising/run.toml # 正式运行
 
 [用户教程](docs/zh/tutorial.md)逐步讲解，并给出每一步的期望输出。
 
+### 没有 Slurm 的工作站（单机模式）
+
+bootlab 也能在一台没有 Slurm 的 Linux 机器上跑：
+- 镜像里的程序用 `apptainer exec` 启动，MPI 程序经镜像自带的 `mpirun` 启动；
+- 每个物理核一个 rank，绝不用一个核的第二个硬件线程；
+- 内存按开跑时本机可用的内存算。
+
+前提：
+- Apptainer 能免 root 运行：要么开了用户命名空间（现在多数发行版默认开），要么是 setuid 安装；
+- `apptainer` 在 PATH 上即可。工作站上通常没有 module 系统，也不需要别的设置；集群上的 `module load apptainer` 与单机模式无关；
+- 宿主机不需要 Slurm：生成器取节点表时，用的是镜像自带的 `scontrol` 替身，它回答本机名；
+- bootlab 镜像放在本地路径上；
+- 只有一台机器，不支持跨机器求解；
+- 与集群上一样，主机上不需要 Python。
+
+```bash
+./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <镜像的 sha256>
+bin/bootlab probe local --sif /path/to/bootlab-exec-r5.sif --out probe   # 在本机跑几分钟：核、内存、磁盘、全核 mpirun
+touch ws.hand.toml
+bin/bootlab site gen --probe probe/probe.json --hand ws.hand.toml --out sites/ws
+echo 'site = "ws"' >> bootlab.toml
+
+bin/bootlab regress --wait                 # 在前台跑完：PASS / FAIL
+bin/bootlab submit examples/ising/run.toml # 后台运行（setsid nohup），日志在 runs/ 下
+bin/bootlab stop runs/<运行目录>            # 求解器先写好检查点；之后续算：
+bin/bootlab submit --resume runs/<运行目录>
+```
+
+bootlab 怎样选择：
+- 没有 Slurm（没有 `SLURM_JOB_ID`，PATH 上也没有 `sbatch`）时就按单机跑；站点或 bootlab.toml 里写 `launcher = "local"` 或 `"slurm"` 可以直接指定。`driver.log` 记下用的是哪种、依据是什么。
+- 同一台机器同一时刻只跑一个单机运行（运行目录下有一把锁）。
+- `pmp2sdp` 的内存看门狗读每个实例的进程（`smaps_rollup` 的 Pss_Anon + Pss_Shmem）。`memory_guard = "systemd"` 时改用带内存上限的 systemd 用户 scope；探测时它可用，站点就默认用它。
+
+`submit --systemd` 把驱动作为临时的 systemd 用户单元启动。后台运行与退出登录：
+- 有的系统在退出登录时会结束这个会话的所有进程（logind.conf 里 `KillUserProcesses=yes`），nohup 起的也一样；
+- 用户单元要在退出登录后继续跑，需要 `loginctl enable-linger`。
+
 ## 文档
 
 | | English | 中文 |
@@ -96,7 +135,7 @@ bin/bootlab submit examples/ising/run.toml # 正式运行
 - **Navigator**（用 `sdpb` 和 `approx_objective` 极小化 navigator 函数）。
 - **可行性扫描与二分**：互相独立的点用 Slurm 作业数组。
 - **Delaunay 区域搜索、OPE 扫描、极值泛函（EFM）谱提取。**
-- **`bootlab bench`**：一条命令在一个真实的点上实测各项资源配置（block 表、`pmp2sdp`、求解器进程数），写进站点的 bench 文件。
+- **`bootlab bench` 的其余部分**：现在它测单节点上求解器的进程数；block 表、`pmp2sdp` 的实例数和多节点以后再加。
 - **带自旋的外部算符**（守恒流、应力张量的自举）：另写一个 PMP 生成器，输出同一种 PMP 格式。
 
 ## 已知限制
@@ -107,6 +146,8 @@ bin/bootlab submit examples/ising/run.toml # 正式运行
   助手来写（[指南](docs/zh/writing-models-with-ai.md)）。
 - 只在一个集群上开发和测试过（四种节点型号、InfiniBand、经 IPoIB 的 NFS）。探测和生成站点就是为别的集群准备的，但还没在别的
   集群上跑过。
+- 单机模式是在一台计算节点上把 Slurm 藏起来验收的，没有在真正没有 Slurm 的机器上跑过。它有两个选项只有单测：`memory_guard = "systemd"`
+  （经 systemd 用户 scope 做 pmp2sdp 的内存看门狗）和 `submit --systemd`（把驱动作为 systemd 用户 unit 启动）。
 
 ## 致谢
 

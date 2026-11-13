@@ -9,7 +9,7 @@
 [5 转换层](#5-转换层各模块) · [6 生成器输入](#6-接口一生成器输入) · [7 PMP](#7-接口二pmp) · [8 执行](#8-执行层一次-dive) ·
 [9 资源](#9-资源由实测决定) · [10 Skydive 循环](#skydive-loop) · [11 检查点与续算](#11-检查点留下的一代续算) ·
 [12 记录](#12-记录) · [13 安装与站点](#13-安装bootlabtoml-与站点) · [14 多节点](#multi-node-solves) ·
-[15 探测与站点生成](#15-探测与站点生成) · [16 回归](#16-回归) · [17 扩展 bootlab](#17-扩展-bootlab)
+[15 探测与站点生成](#15-探测与站点生成) · [16 回归](#16-回归) · [17 扩展 bootlab](#17-扩展-bootlab) · [18 单机模式](#local-mode)
 
 ## 原则
 
@@ -188,6 +188,7 @@ gap_upper_limit = "1e-12"                  # 必须写
 # gap_threshold_tighten = true
 # infinitesimal = "1e-20"                  # >= 1e-25
 # block_timings = "/绝对路径/checkpoint/block_timings"   # 新运行：用另一次运行的块耗时，不做 timing run
+# mixed_precision = false                  # true：见 10.1 节
 
 [solver]                                   # SDPB 选项，键是参数名，覆盖 skydive.solver_defaults(nmax)
 [dynamical]                                # dynamical_sdp 自己的选项，覆盖 skydive.DYNAMICAL_DEFAULTS
@@ -317,6 +318,12 @@ class Dive:
 
 没有 bench 文件就意味着：全部物理核、单节点、第一步实测 `pmp2sdp`。
 
+**`bootlab bench <run.toml> [--node H] [--time] [--dry]`**（`benchrun.py`）：经 `submit` 交一个整机作业（作业里运行 `bench run <run.toml>`；
+单机模式下在后台运行）。生成器只写运行起点这一个点的 PMP，一个 `pmp2sdp` 转成 SDP，`sdpb_3.0sky` 在全部物理核和一半物理核上各跑
+`--maxIterations 12`（只取过得了 `grid_ok` 的进程数）。每次迭代的秒数 = 迭代表的 (t₁₂ − t₄) / 8（整秒）。每个进程数写一行 `solver`（`model`、
+`lambda`、`N`、`blocks`、`precision`、`program`、`nodes` = 1、`procs_per_node`、`s_per_iter`、`source` = 日期和机器的插槽数、CPU 型号、物理核数、
+内存），追加到 `<站点的 bench>/<节点型号>.json`。
+
 <a id="skydive-loop"></a>
 ## 10. Skydive 循环
 
@@ -341,13 +348,32 @@ class Dive:
 用现在的规则 84 步收敛，用它的早先版本要 192 步）。注意：`allowed` 的终点是一个 N < 0 的点，不是 N 唯一的极小点；在平坦的方向上，
 两次运行终点的差别可能远大于 N 的差别。
 
+### 10.1 混合精度（`mixed_precision = true`）
+
+默认关；`bin/bootlab regress` 用全精度。求解器和 `pmp2sdp` 用 {384, 512, 768, 1024} 中低于问题 `solver_precision` 的、满足
+`0.30103·P − 85 − 0.6·log10(1/间隙) ≥ 30` 位的最小精度 P（间隙取上一条记录的，开始时取 `gap_upper_limit`），都不满足就用全精度。
+只升不降。依据（实测）：`infinitesimal` 为 1e-40 时 Λ = 23、27 分别丢 78、83 位，那里 384–512 位时整步快 2.3–2.6 倍；
+1e-20 时 Ising Λ = 11 丢 68 位（384 位与 785 位、与参考程序都一致到 47.5 位）；间隙 6.8e-21 时 384、512 位的步长与
+785 位分别一致到 40.9、80.2 位（按公式折算丢 62 位）。按这个规则，
+间隙从约 1 到 1e-30 都是 512 位。
+
+- **健康检查**（低于全精度时；触发后从下一次调用起用全精度）：调用中止；`findMinimumQ` 和上一次走步的调用不同；既没爬升也不是冷启动的
+  调用，迭代数超过 max(4, 最近 5 次这类调用迭代数中位数的 2 倍)。不查 N 的符号。
+- **结束**：低于全精度的调用以 `optimal` 结束时不下结论；在同一点、用同一 BFGS 状态再用全精度解一次（低精度那次的日志移到
+  `steps/<n>-<P>bits/`），由这一次决定。终点和 EFM 都是全精度。
+- **检查点**：二进制检查点里每个数的长度由精度决定，文件里不存精度，`dynamical_sdp` 读不了别的精度写的检查点（它的文本检查点要求
+  每次低于全精度的调用都把 X、Y 写成文本）。调用的精度不低于它所用的留下的一代（`layout.json` 的 `precision`；没有就是问题的精度）；
+  要升高时，驱动先把这一代按新精度改写成下一代，limb 补零（`precision.convert_checkpoint`）。所以检查点已是全精度的运行再打开混合精度，
+  仍是全精度。续算从最后一条记录的 `precision_next` 接着。
+- 生成器不变（PMP 是十进制文本）；精度升高时重新测一次 `pmp2sdp` 的内存。
+
 ## 11. 检查点、留下的一代、续算
 
 - `dynamical_sdp` 的 `--checkpointDir` 就是 `<运行目录>/checkpoint/`（各节点共用）。SDPB 写第 g+1 代时先由各 rank 写自己的文件，然后写
   `checkpoint_new.json`，再原子地改名为 `checkpoint.json`，只留两代；所以任何时刻被杀，`checkpoint.json` 指的那一代都完整，但它可能是
   一次调用中途的那一代。
 - 所以每次调用结束后、写它的第 k 条记录之前，bootlab 建 `checkpoint/kept/<k>/`：这一代各 rank 文件的硬链接，`checkpoint.json` 和
-  `block_timings` 的拷贝，以及 `layout.json`（`nodes`、`node_type`、`ppn`、`generation`）；先在 `kept/<k>.new` 里建好再改名。记录写完后删掉
+  `block_timings` 的拷贝，以及 `layout.json`（`nodes`、`node_type`、`ppn`、`precision`、`generation`）；先在 `kept/<k>.new` 里建好再改名。记录写完后删掉
   更早的 kept，所以任何时刻至多三代，每条记录写完后两代。
 - **续算**：取 k ≤ 记录数的最大 `kept/<k>`；更新的和没建完的删掉；`checkpoint/` 里只删别的代的 rank 文件；把留下的文件链回来。布局
   （节点数、型号、每节点进程数）变了就冷启动。运行目录所在的文件系统必须能建硬链接：每次 run、resume 开始时试建一个，不行就停。
@@ -369,6 +395,8 @@ class Dive:
 | `procs`、`node`、`nodes` | 每节点进程数；节点 0；全部节点（多节点时） |
 | `pmp2sdp` | P、k、测量的那一步、memory.peak、节点内存的增量 |
 | `seconds` | `pmp`、`sdp`、`dive`；多节点时还有 `copy`；`checkpoint` |
+| `precision` | 这次调用 `pmp2sdp` 和求解器的位数 |
+| `precision_next`、`precision_note`、`call_iterations`、`first_call` | 只在混合精度时有（10.1）：下一次的位数、变化的原因、这次的迭代数、冷启动 |
 
 `solves.jsonl` 不记时刻，所以同一布局、同一份块耗时的两次运行可以逐字节比较。
 
@@ -439,7 +467,8 @@ TCP 用 `tcp,self,sm`）。
 
 ## 15. 探测与站点生成
 
-`bootlab probe plan`（登录节点）→ `probe node` 作业（每型号一个），可选 `probe pair` 作业 → `probe merge` → `bootlab site gen`。
+`bootlab probe plan`（登录节点）→ `probe node` 作业（每型号一个），可选 `probe pair` 作业 → `probe merge` → `bootlab site gen`。`probe plan --partition P` 只读分区 P（`sinfo -p`），作业交到 P，并在 plan.json 里记下 `partition`；之后
+`site gen` 只放探测过的型号，写 `[slurm] partition = P`（手写文件的 `[slurm]` 优先）。`probe plan --node H` 在 H 上探测，不管它忙不忙。
 
 | 文件 | 内容 |
 |---|---|
@@ -480,3 +509,62 @@ TCP 用 `tcp,self,sm`）。
 - **新站点**：探测后生成（第 15 节），或者复制 `sites/_template`。
 - **新的实测**：按同样的格式往 bench 文件里追加记录，写明来源。
 - 测试：单元测试加在 `tests/` 下；改动数值的地方要跑回归（第 16 节）或同样强度的对照。
+
+<a id="local-mode"></a>
+## 18. 单机模式（没有 Slurm 的一台机器）
+
+bootlab 可以在一台没有 Slurm 的 Linux 机器（工作站）上运行。物理层、转换层、Skydive 循环、检查点和留下的代、续算、记录都与集群上相同；不同的只有
+启动方式、资源和内存看门狗。命令见 README 的[单机模式一节](../../README.zh-CN.md)。
+
+**用哪种启动方式**（`execute.site_launcher`；`driver.log` 写明选了哪种、依据是什么）：
+
+1. 站点的 `launcher`（`"slurm"` 或 `"local"`），没写就看 bootlab.toml；
+2. 都没写时，设了 `SLURM_JOB_ID`（在作业里）或 PATH 上有 `sbatch`，就是 `slurm`；
+3. 否则是 `local`。
+
+**启动程序**（`execute.local_argv`、`launch`）：
+
+- 镜像里的每个程序都是 `apptainer exec <binds> <sif> …`；主机上只需要 apptainer；
+- MPI 程序经镜像自带的 `mpirun` 加 rankfile 启动：第 i 个 rank 绑列表里的第 i 个 cpu，用物理编号，`--bind-to hwthread`。列表是每个物理核的第一个
+  硬件线程（`execute.physical_cpus`），所以一个 rank 不会和别的 rank 共用一个核，也不会用到一个核的第二个线程；
+- 同时运行的几个程序（一波里的几个 `pmp2sdp` 实例）各分列表里互不相交的一段，相当于集群上的 `srun --exact` 步；
+- 启动器给每个程序设 `OMPI_MCA_plm=isolated`（不会经 srun 起 rank），并去掉 `SLURM_*`、`PMIX_*`、`PMI_*` 变量；`UCX_TLS=self,sm`（只走共享内存）
+  来自 `site gen` 写进单机站点的 `[env]`；
+- 生成器不是 MPI 程序：它在镜像的 `taskset` 下用整张列表运行，`SLURM_JOB_NODELIST` 设为本机（这是它唯一得到的 Slurm 变量），节点列表由镜像里的
+  `scontrol` 替身给出；
+- 各程序与驱动在同一个进程组里（`submit` 用 setsid 起驱动，自成一组）；任何一个 rank 失败，它所在的整个 `mpirun` 作业结束。
+
+**资源**：本机的物理核（按进程的亲和性），以及开跑时的可用内存（MemAvailable，至多站点的 `mem_gb`），再减去 `driver_reserve_mb`。除非 `[solver]`
+自己写了，否则不传 `--maxRuntime`；运行按它自己的规则结束，或者由 `bootlab stop` 停下。
+
+**没有 Slurm cgroup 时的 pmp2sdp 看门狗**（`execute.build_sdps_local`；第 9 节的规则不变：第一步测一个实例，k = ⌊内存 ÷ (1.15 P)⌋，某个实例超过
+份额的 95% 就撤掉整波）：
+
+| `memory_guard` | 读什么 | solves.jsonl 里的 `measure` |
+|---|---|---|
+| `rss`（默认） | 实例进程树上 `smaps_rollup` 的 Pss_Anon + Pss_Shmem 之和（共享页只计一次；没有 smaps_rollup 时用 RssAnon 之和，不含共享内存） | `pss`（或 `rss_anon`） |
+| `systemd`（probe local 测到可用时设置） | 实例运行在带 `MemoryMax`/`MemoryHigh` 的 `systemd-run --user --scope` 里，像集群上一样读这个 scope 的 cgroup | `cgroup` |
+
+被撤的一波先收到 SIGTERM，再收到 SIGKILL；这一步以失败结束。
+
+**命令**（名字与集群上相同）：
+
+| 命令 | 单机时的含义 |
+|---|---|
+| `bin/bootlab probe local --sif <镜像> --out probe [--shared <目录>] [--local <目录>] [--sdp <小 SDP>]` | 直接在本机测，几分钟：CPU 和物理核、内存、按 bootlab 文件形态测各盘、运行目录、apptainer 和镜像、全核 `mpirun` 以及两半同时（记下每个 rank 的绑定；给了 `--sdp` 时再用它跑 `sdpb`）、systemd 用户 scope 能否限内存；写出 `probe/node-<主机>-local.json` 和 `probe/probe.json` |
+| `bin/bootlab site gen --probe probe/probe.json --hand <文件> --out sites/<名字>` | 对单机探测：`launcher = "local"`，本机是唯一的节点型号，没有 `[multinode]`，没有 IB，`[mpi] transport = "local"`，`UCX_TLS = "self,sm"`，最快的 scratch，`memory_guard`；手写文件里可以给 `mem_gb` 和 `bench` |
+| `bin/bootlab submit <run.toml>` / `submit --resume <运行目录>` | 在后台启动驱动（`setsid nohup`；加 `--systemd` 时作为临时的用户 unit），日志放在 `<runs>/` 下；`<运行目录>/driver.pid` 记它的进程组 |
+| `bin/bootlab stop <运行目录> [--wait <秒>]` | 求解器在跑时，只给求解器的 rank 发 SIGTERM（不经 `mpirun`，否则它几秒后会补发 SIGKILL）：rank 写好检查点，这次调用以 `unfinished: SIGTERM signal received` 结束，驱动记下后正常结束；不在求解时，对驱动的进程组发 SIGTERM，续算时这一步从最后保留的那一代重做。`--wait`（默认 600 秒）等驱动的进程组结束。旧驱动的进程组还活着时，`submit --resume` 会拒绝 |
+| `bin/bootlab regress --wait` | 在本机前台跑回归，打印 PASS 或 FAIL（只在单机模式下可用；集群上由作业去跑，`--wait` 会报错退出） |
+
+一台机器同时只跑一个单机运行：驱动持有 `<runs>/.local.lock`，第二次 `submit` 会说明是哪个运行占着。
+
+**被中止的调用的迭代数**（两种启动方式都适用）：被中止的调用（SIGTERM、maxRuntime、maxIterations）的记录里，累计迭代数包括这次调用自己做的迭代
+（从求解器的迭代表读出），所以中途停下再续算的运行，与没停过的运行计数相同。求解器输出里没有迭代表时，记录写 `iterations_unknown` 和原因；续算从
+最后一个已知的计数接着走，并写明这一点；`regress check` 会点出这样的调用。集群上 `scancel` 时驱动也被杀，不留 aborted 记录，续算从上一条记录保留的
+那一代整步重算，计数规则与以前相同；这条规则之前写下的 aborted 记录（没有迭代数，也没有 `iterations_unknown`）在续算时照旧跳过，不报警。
+
+`memory_guard = "systemd"` 时，某次采样读不到 scope 的 cgroup 就跳过这一次，不会退回 Pss。
+
+**还没测过的**：`memory_guard = "systemd"` 和 `submit --systemd`（只有单测覆盖命令的写法），以及真正没有 Slurm 的机器（验收是在一台计算节点上把
+Slurm 藏起来模拟的）。见 README 的已知限制。

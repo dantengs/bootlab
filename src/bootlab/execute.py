@@ -68,6 +68,9 @@ class Site:
     scratch_basis: str = None                        # why scratch is what it is (site gen: each way's seconds, probe jobs)
     shared_network: dict = None                      # the runs file system as the probe saw it: server, network, basis
     shared_measured_at: list = None                  # the directories the probe measured the shared file system in
+    launcher: str = None                             # slurm | local; None: site_launcher decides
+    mem_gb: int = None                               # local: the memory bootlab may use at most (else MemAvailable)
+    memory_guard: str = None                         # local: rss (the default) | systemd (a scope per pmp2sdp instance)
 
     @property
     def transfer(self) -> str:
@@ -125,6 +128,8 @@ def site_paths(s: dict, root: Path = None) -> dict:
             raise SystemExit("no image: the site's sif, or image in <install root>/bootlab.toml")
         s["sif"] = c["image"]
     s["runs"] = os.environ.get("BOOTLAB_RUNS") or s.get("runs") or c.get("runs") or str(root / "runs")
+    if "launcher" not in s and c.get("launcher"):
+        s["launcher"] = c["launcher"]
     if not s.get("python"):
         own = root / "python" / "bin" / "python3"
         s["python"] = c.get("python") or (str(own) if own.exists() else None)
@@ -267,6 +272,9 @@ class Node:
     mem_mb: int       # the job's memory on this node
     hosts: list = None
     shared: bool = False   # the run's scratch is on a file system every node sees: nothing is copied between nodes
+    launcher: str = "slurm"    # slurm | local (site_launcher)
+    cpus: list = None          # local: the first hardware thread of each physical core the driver may use
+    launcher_why: str = None   # why that launcher (driver.log)
 
     @property
     def multi(self) -> bool:
@@ -291,7 +299,12 @@ class Node:
         return [] if self.shared else [h for h in self.all_hosts if h != self.host]
 
     @staticmethod
-    def here(node_types: dict = None) -> "Node":
+    def here(node_types: dict = None, launcher: str = "slurm", mem_gb: int = None) -> "Node":
+        if launcher == "local":    # one machine: its physical cores and the memory available now
+            host = socket.gethostname().split(".")[0]
+            cpus = physical_cpus(os.sched_getaffinity(0))
+            return Node(host, node_type_of(host, node_types or {}), len(cpus), local_mem_mb(mem_gb),
+                        launcher="local", cpus=cpus)
         host = socket.gethostname().split(".")[0]
         cpus = os.sched_getaffinity(0)
         cores = set()
@@ -496,9 +509,32 @@ class Dive:
     climbed: bool = None
     find_minimum: bool = None
     seconds: dict = field(default_factory=dict)
+    call_iterations: int = None       # aborted: the iterations this call made (call_iterations), None unknown
 
 
-def read_dive(out_dir: Path, exit_code: int) -> Dive:
+# a row of dynamical_sdp's iteration table: the call's iteration number, the seconds, mu, P-obj (signed), ...
+_ITERATION_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+\S+\s+[+-]\S+\s", re.M)
+
+
+def call_iterations(stdout: Path):
+    """The iterations a dynamical_sdp call made, from its own output (the iteration table's numbers start at 1
+    in every call, a call resumed from a checkpoint too); None without a table."""
+    try:
+        rows = _ITERATION_ROW.findall(stdout.read_text(errors="replace"))
+    except OSError:
+        return None
+    return max(int(r[0]) for r in rows) if rows else None
+
+
+def read_dive(out_dir: Path, exit_code: int, stdout: Path = None) -> Dive:
+    """The solver's results; for an aborted call also the iterations it made (call_iterations of its stdout)."""
+    d = _read_dive(out_dir, exit_code)
+    if d.verdict == "aborted" and stdout is not None:
+        d.call_iterations = call_iterations(stdout)
+    return d
+
+
+def _read_dive(out_dir: Path, exit_code: int) -> Dive:
     out_txt = out_dir / "out.txt"
     if not out_txt.exists():
         return Dive("aborted", f"failed: dynamical_sdp exit {exit_code}, no out.txt")
@@ -587,6 +623,8 @@ def build_sdps(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: in
 
     Where the steps' cgroups cannot be read (cgroup v1, another layout: an external boundary) there is no
     watchdog: the wave's "watchdog" is false and held_mb is node_mb, the node's MemTotal - MemAvailable rise."""
+    if node.launcher == "local":
+        return build_sdps_local(site, node, pmps, sdp_root, precision, log_dir, instances, procs)
     mem = (node.mem_mb - site.driver_reserve_mb) // instances
     try:
         job = job_cgroup()
@@ -675,7 +713,315 @@ def run_dynamical_sdp(site: Site, node: Node, procs: int, center: Path, neighbor
         # is the run's, which every node sees). One remote call: a step costs about a second with transfer srun.
         on_hosts(site, node, remote_tar(site, "-C", "/", "-xf", "-", before=f"mkdir -p {out_dir} && "),
                  node.others, small_tar([nsv]))
-    return start(srun_argv(site, argv, procs, 1, mem, mpi=True, hosts=node.spread()), log).wait()
+    return launch(site, node, argv, procs, 1, mem, True, log, hosts=node.spread()).wait()
+
+
+# ---------------------------------------------------------------- local mode (no Slurm; README)
+#
+# One workstation, no Slurm: the image's programs start with `apptainer exec`, MPI ones through the image's
+# own mpirun (all ranks children of it in one container), bound to the physical cores (the first hardware thread
+# of each core; concurrent programs get disjoint cores). The memory is MemAvailable at the start (at most the
+# site's mem_gb). The slurm functions above are unchanged: launch() chooses.
+
+LAUNCHERS = ("slurm", "local")
+LOCAL_UNSET = ("SLURM_", "PMIX_", "PMI_")   # mpirun in a Slurm job would start its ranks with srun
+
+
+def site_launcher(site: Site) -> tuple:
+    """(launcher, why): the site's or bootlab.toml's launcher when given; else slurm inside a Slurm job
+    (SLURM_JOB_ID) or where sbatch is on PATH, local otherwise."""
+    if site.launcher:
+        if site.launcher not in LAUNCHERS:
+            raise SystemExit(f"site {site.name}: launcher {site.launcher!r}: slurm or local")
+        return site.launcher, f"the site (or bootlab.toml) says launcher = {site.launcher}"
+    if os.environ.get("SLURM_JOB_ID"):
+        return "slurm", f"SLURM_JOB_ID is set ({os.environ['SLURM_JOB_ID']}): inside a Slurm job"
+    if shutil.which("sbatch"):
+        return "slurm", f"sbatch is on PATH ({shutil.which('sbatch')})"
+    return "local", "no SLURM_JOB_ID and no sbatch on PATH: a machine without Slurm"
+
+
+def physical_cpus(cpus, sysdir: Path = Path("/sys/devices/system/cpu")) -> list:
+    """The first hardware thread (the lowest cpu number) of each physical core among cpus: one rank or worker a
+    core, never a core's second thread."""
+    first = {}
+    for c in sorted(cpus):
+        topo = sysdir / f"cpu{c}" / "topology"
+        key = ((topo / "physical_package_id").read_text().strip(), (topo / "core_id").read_text().strip())
+        first.setdefault(key, c)
+    return sorted(first.values())
+
+
+def local_mem_mb(cap_gb: int = None, meminfo: Path = Path("/proc/meminfo")) -> int:
+    """The memory a local run uses: MemAvailable now (a workstation runs other things), at most cap_gb."""
+    m = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in meminfo.read_text().splitlines())}
+    mb = m["MemAvailable"] // 1024
+    return min(mb, cap_gb * 1024) if cap_gb else mb
+
+
+def local_env() -> dict:
+    """The environment of a local program: the driver's without Slurm's and PMIx's variables, and mpirun's
+    launcher isolated (Open MPI 4.1.1 in the image has it: every rank on this machine, never through srun)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(LOCAL_UNSET)}
+    env["OMPI_MCA_plm"] = "isolated"
+    return env
+
+
+def write_rankfile(path: Path, cpus: list) -> Path:
+    """Open MPI's rankfile: rank i on cpu i of the list (physical cpu numbers, rmaps_rank_file_physical; with
+    --bind-to hwthread each rank on that hardware thread alone: the first of its core, no hyperthread). mpirun's
+    --cpu-set bound every rank to the whole set instead, taskset around mpirun was not honoured (two programs
+    landed on the same cores), and logical numbers put a rank on a core's second thread."""
+    host = socket.gethostname().split(".")[0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"rank {i}={host} slot={c}\n" for i, c in enumerate(cpus)))
+    return path
+
+
+def local_argv(site: Site, argv: list, cpus: list, mpi: bool, rankfile: Path = None) -> list:
+    """A program of the image on these cpus: MPI through the image's mpirun with a rankfile (write_rankfile), a
+    rank a core of the list; otherwise under the image's taskset (the host needs apptainer only: no host tool
+    is assumed, a node had no tar)."""
+    image = ["apptainer", "exec"]
+    for b in site.binds:
+        image += ["--bind", b]
+    image += [site.sif]
+    if mpi:
+        return image + ["mpirun", "-np", str(len(cpus)), "--rankfile", str(rankfile),
+                        "--mca", "rmaps_rank_file_physical", "1", "--bind-to", "hwthread"] + [str(a) for a in argv]
+    return image + ["taskset", "-c", ",".join(map(str, cpus))] + [str(a) for a in argv]
+
+
+def launch(site: Site, node: Node, argv: list, ntasks: int, cpus: int, mem_mb: int, mpi: bool, log: Path,
+           container: bool = True, hosts: list = None, cores: list = None, wrap: list = None) -> subprocess.Popen:
+    """Start one program of a step: srun (srun_argv, unchanged) or, local, on cores (default the first
+    ntasks x cpus physical cores); wrap goes before a local command (systemd-run's scope)."""
+    if node.launcher != "local":
+        return start(srun_argv(site, argv, ntasks, cpus, mem_mb, mpi, container, hosts), log)
+    if not container:
+        raise SystemExit("local mode runs only the image's programs")
+    use = cores if cores is not None else node.cpus[:ntasks * cpus]
+    env = local_env()
+    if not mpi:    # the generator: Hyperion asks scontrol (the image's stand-in) for $SLURM_JOB_NODELIST's hosts
+        env["SLURM_JOB_NODELIST"] = node.host
+    rankfile = write_rankfile(log.with_suffix(".rankfile"), use) if mpi else None
+    return start((wrap or []) + local_argv(site, argv, use, mpi, rankfile), log, env=env)
+
+
+def descendants(pid: int, proc: Path = Path("/proc")) -> list:
+    """pid and every process below it (by the parent pids of /proc/<n>/stat)."""
+    children = {}
+    for d in proc.iterdir():
+        if d.name.isdigit():
+            try:
+                stat = (d / "stat").read_text()
+            except OSError:
+                continue
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            children.setdefault(ppid, []).append(int(d.name))
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        todo += children.get(p, [])
+    return out
+
+
+def tree_memory_mb(pid: int, proc: Path = Path("/proc")) -> tuple:
+    """(MB, measure) of a process tree that memory pressure cannot reclaim: the sum of smaps_rollup's
+    Pss_Anon + Pss_Shmem (shared pages split between their processes, so the sum counts each once: MPI's sm
+    transport is shared memory); without smaps_rollup the sum of RssAnon, which leaves the shared memory out.
+    A process that has ended (a zombie: neither of the two) holds no memory and is passed."""
+    total, measure = 0, "pss"
+    for p in descendants(pid, proc):
+        try:
+            rollup = (proc / str(p) / "smaps_rollup").read_text()
+            kb = dict((l.split(":")[0], int(l.split()[1])) for l in rollup.splitlines() if l.startswith("Pss_"))
+            total += kb["Pss_Anon"] + kb["Pss_Shmem"]
+        except (OSError, KeyError, IndexError, ValueError):
+            try:
+                status = (proc / str(p) / "status").read_text()
+            except OSError:
+                continue                                  # the process ended as it was read
+            rss = [l.split()[1] for l in status.splitlines() if l.startswith("RssAnon:")]
+            if rss:
+                total += int(rss[0])
+                measure = "rss_anon"
+    return total / 1024, measure
+
+
+def running(pid: int, proc: Path = Path("/proc")) -> bool:
+    """The process exists and is not a zombie (ended, its parent has not waited for it yet)."""
+    try:
+        return (proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def end_trees(pids: list, grace: float = 10):
+    """SIGTERM every process of these trees, SIGKILL what is left after grace seconds."""
+    import signal
+    procs = {p for pid in pids for p in descendants(pid)}
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in procs:
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+        t = time.time() + grace
+        while sig == signal.SIGTERM and time.time() < t and any(running(p) for p in procs):
+            time.sleep(0.2)
+
+
+def scope_cgroup(unit: str) -> Path:
+    """The cgroup directory of a systemd user scope."""
+    out = subprocess.run(["systemctl", "--user", "show", "-P", "ControlGroup", unit], capture_output=True,
+                         text=True).stdout.strip()
+    return Path("/sys/fs/cgroup" + out) if out else None
+
+
+def scope_memory(d: Path):
+    """(held, peak, limit) of a systemd scope in MB: as step_memory, the scope's own cgroup."""
+    stat = dict(line.split() for line in (d / "memory.stat").read_text().splitlines())
+    current = int((d / "memory.current").read_text())
+    peak = int((d / "memory.peak").read_text()) if (d / "memory.peak").exists() else current
+    limit = (d / "memory.max").read_text().strip()
+    return ((current - int(stat["file"]) + int(stat["shmem"])) / 2 ** 20, peak / 2 ** 20,
+            None if limit == "max" else int(limit) / 2 ** 20)
+
+
+def build_sdps_local(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: int, log_dir: Path,
+                     instances: int, procs: int):
+    """build_sdps on a machine without Slurm: the instances of a wave on disjoint physical cores; the
+    watchdog reads each instance's process tree (tree_memory_mb) or, with memory_guard = systemd, its scope's
+    cgroup; over MEMORY_WATCH of its share the wave's trees are ended and the step fails. The waves as
+    build_sdps's, with "measure" (pss, rss_anon, cgroup) and "watchdog" true."""
+    mem = (node.mem_mb - site.driver_reserve_mb) // instances
+    scoped = site.memory_guard == "systemd"
+    names = list(pmps)
+    sdps, failed, waves = {}, [], []
+    for i in range(0, len(names), instances):
+        batch = names[i:i + instances]
+        base = node_used_mb()
+        running, units = {}, {}
+        for j, name in enumerate(batch):
+            sdps[name] = sdp_root / name
+            argv = [site.pmp2sdp, "--precision", precision, "--input", pmps[name], "--output", sdps[name]]
+            wrap = None
+            if scoped:
+                units[name] = f"bootlab-pmp2sdp-{os.getpid()}-{i + j}.scope"
+                wrap = ["systemd-run", "--user", "--scope", "--quiet", "--unit", units[name],
+                        "-p", f"MemoryMax={mem}M", "-p", f"MemoryHigh={mem}M"]
+            running[name] = launch(site, node, argv, procs, 1, mem, True, log_dir / f"pmp2sdp-{name}",
+                                   cores=node.cpus[j * procs:(j + 1) * procs], wrap=wrap)
+        wave = {"names": batch, "held_mb": 0.0, "cgroup_peak_mb": 0.0, "node_mb": 0.0, "watchdog": True,
+                "measure": "cgroup" if scoped else "pss"}
+        over = None
+        while over is None and any(p.poll() is None for p in running.values()):
+            for name, p in running.items():
+                if p.poll() is not None:
+                    continue
+                if scoped:
+                    d = scope_cgroup(units[name])
+                    try:
+                        held, peak, _ = scope_memory(d)
+                    except (OSError, KeyError, ValueError, TypeError):
+                        continue
+                else:
+                    held, measure = tree_memory_mb(p.pid)
+                    peak = held
+                    if measure != "pss":
+                        wave["measure"] = measure
+                wave["held_mb"] = max(wave["held_mb"], held)
+                wave["cgroup_peak_mb"] = max(wave["cgroup_peak_mb"], peak)
+                if held > MEMORY_WATCH * mem:
+                    over = f"{name} held {held:.0f} MB of its {mem} MB ({wave['measure']})"
+            wave["node_mb"] = max(wave["node_mb"], node_used_mb() - base)
+            if over is None:
+                time.sleep(SAMPLE_SECONDS)
+        if over:
+            end_trees([p.pid for p in running.values()])
+            wait_all(running)
+            raise StepFailed(f"pmp2sdp {', '.join(batch)}: {over}; the wave was ended (an instance needs "
+                             f"more memory than its share)")
+        failed += [f"{n} exit {c}" for n, c in wait_all(running).items() if c != 0]
+        waves.append({**wave, **{k: round(wave[k]) for k in ("held_mb", "cgroup_peak_mb", "node_mb")}})
+    if failed:
+        raise StepFailed("pmp2sdp " + ", ".join(failed))
+    return sdps, waves
+
+
+LOCK = None   # the local driver's lock file, open while it runs
+
+
+def local_lock(runs: Path, what: str):
+    """One local run on this machine at a time: an exclusive flock on
+    <runs>/.local.lock, held while the driver lives; its text names what holds it."""
+    import fcntl
+    global LOCK
+    runs.mkdir(parents=True, exist_ok=True)
+    f = open(runs / ".local.lock", "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.seek(0)
+        held = f.read().strip()
+        f.close()
+        raise SystemExit(f"another local run holds {runs / '.local.lock'}: {held}")
+    f.seek(0)
+    f.truncate()
+    f.write(f"{what} pid {os.getpid()} since {now()}\n")
+    f.flush()
+    LOCK = f
+
+
+def write_driver_pid(run_dir: Path):
+    """<run dir>/driver.pid: the driver's process group (bootlab submit starts it with setsid), for bootlab stop
+    and for a resume to see that no driver of the run still lives."""
+    (run_dir / "driver.pid").write_text(json.dumps({"pid": os.getpid(), "pgid": os.getpgid(0),
+                                                    "host": socket.gethostname().split(".")[0], "start": now()}) + "\n")
+    if LOCK:
+        LOCK.write(f"run directory {run_dir}\n")
+        LOCK.flush()
+
+
+def lock_holder(runs: Path):
+    """What holds <runs>/.local.lock now, or None (bootlab submit looks before it starts a driver)."""
+    import fcntl
+    f = runs / ".local.lock"
+    if not f.exists():
+        return None
+    with open(f, "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.seek(0)
+            return fh.read().strip() or "a local run"
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return None
+
+
+def solver_ranks(pid: int, solver: str, proc: Path = Path("/proc")) -> list:
+    """The processes below pid that run the solver itself (argv[0] its name; not mpirun, not apptainer)."""
+    out = []
+    for p in descendants(pid, proc):
+        try:
+            argv = (proc / str(p) / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0].decode(errors="replace")) == solver:
+            out.append(p)
+    return out
+
+
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def sdp_size(sdp: Path):

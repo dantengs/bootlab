@@ -42,6 +42,15 @@ runs = "/shared/bootlab/runs"            # run directories (with the solver's ch
 # node 0's files). One plain path: used as it is, no check.
 scratch = ["$SLURM_TMPDIR/bootlab", "/local/scratch/$USER-bootlab", "shared"]
 driver_reserve_mb = 4096                 # memory kept back from the steps for the driver and the page cache
+# How the programs start: "slurm" (srun steps in a job) or "local" (one machine without Slurm: apptainer exec
+# and the image's mpirun, a rank a physical core). Left out: slurm inside a job or where sbatch is on PATH,
+# local otherwise. `bootlab probe local` and site gen write local sites.
+# launcher = "local"
+# Local only: the memory a run may use at most (default: MemAvailable at the start), and the pmp2sdp memory
+# watchdog: "rss" (each instance's processes, smaps_rollup Pss_Anon + Pss_Shmem) or "systemd" (a user scope
+# with MemoryMax per instance; the probe says whether it works here).
+# mem_gb = 96
+# memory_guard = "rss"
 # Measured data (sites/<name>/bench/<node type>.json): solver processes, pmp2sdp at once, nodes for one
 # solve. Left out: bench/ here; none at all means all physical cores, one node, pmp2sdp measured at step 1.
 # bench = "../other-site/bench"

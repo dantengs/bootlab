@@ -14,7 +14,7 @@ Contents: [1 Layers](#1-layers-and-the-two-fixed-interfaces) ·
 [11 Checkpoints and resume](#11-checkpoints-kept-generations-resume) · [12 Records](#12-records) ·
 [13 Installation and sites](#13-installation-bootlabtoml-and-sites) · [14 Multi-node](#multi-node-solves) ·
 [15 Probe and site generation](#15-probe-and-site-generation) · [16 Regression](#16-regression) ·
-[17 Extending bootlab](#17-extending-bootlab)
+[17 Extending bootlab](#17-extending-bootlab) · [18 Local mode](#local-mode)
 
 ## Principles
 
@@ -210,6 +210,7 @@ gap_upper_limit = "1e-12"                  # required
 # gap_threshold_tighten = true
 # infinitesimal = "1e-20"                  # >= 1e-25
 # block_timings = "/abs/path/checkpoint/block_timings"   # a new run: another run's block costs, no timing run
+# mixed_precision = false                  # true: section 10.1
 
 [solver]                                   # SDPB options by flag name, over skydive.solver_defaults(nmax)
 [dynamical]                                # dynamical_sdp's own options, over skydive.DYNAMICAL_DEFAULTS
@@ -350,6 +351,14 @@ p = 127 gives 127 × 1 (slow), 128 gives 16 × 8. Powers of two always qualify.
 
 A missing bench file means: all physical cores, one node, `pmp2sdp` measured at step 1.
 
+**`bootlab bench <run.toml> [--node H] [--time] [--dry]`** (`benchrun.py`): one job of one whole node, via
+`submit` (`bench run <run.toml>` in the job; in local mode in the background). The generator writes the PMP
+of the run's start point alone, one `pmp2sdp` makes its SDP, and `sdpb_3.0sky` runs `--maxIterations 12` on
+all physical cores and on half of them (`grid_ok` counts only). Seconds per iteration = (t₁₂ − t₄) / 8 from the
+iteration table (whole seconds). Each count gives one `solver` row (`model`, `lambda`, `N`, `blocks`,
+`precision`, `program`, `nodes` = 1, `procs_per_node`, `s_per_iter`, `source` = the date and the machine's
+sockets, CPU model, physical cores and memory), appended to `<site bench>/<node type>.json`.
+
 <a id="skydive-loop"></a>
 ## 10. The Skydive loop
 
@@ -381,6 +390,32 @@ steps, one near |N| lets the point move (an Ising Λ = 19 run from a standard st
 with the present rule, against 192 with an earlier version of it). Note: an `allowed` end point is a point with N < 0, not N's unique minimum; along flat
 directions the end points of two runs can differ by far more than N does.
 
+### 10.1 Mixed precision (`mixed_precision = true`)
+
+Off by default; `bin/bootlab regress` runs at full precision. The solver and `pmp2sdp` run at the lowest
+precision P of {384, 512, 768, 1024} below the problem's `solver_precision` with
+`0.30103·P − 85 − 0.6·log10(1/gap) ≥ 30` digits (the gap of the last record, `gap_upper_limit` at the start),
+else at full precision. Never lowered. Basis (measured): 78 and 83 digits lost with `infinitesimal` 1e-40 at
+Λ = 23 and 27, whole steps 2.3–2.6 times faster at 384–512 bits there; 68 digits lost with 1e-20 at Ising Λ = 11
+(384 bits agreed with 785 bits and with the reference program to 47.5 digits); at gap 6.8e-21 the steps at 384
+and 512 bits agreed with 785 bits to 40.9 and 80.2 digits (62 lost by the formula). The rule gives 512 bits from a gap of about 1 down to 1e-30.
+
+- **Health check** below full precision (full from the next call on): the call aborted; `findMinimumQ`
+  differs from the last stepped call's; a call that neither climbed nor started cold made more than
+  max(4, 2 × the median of the last 5 such calls) iterations. N's sign is not checked.
+- **End**: an `optimal` call below full precision decides nothing; the same point with the same BFGS state is
+  solved again at full precision (its logs go to `steps/<n>-<P>bits/`), and that call decides. The endpoint and
+  the EFM are at full precision.
+- **Checkpoint**: the binary checkpoint stores each number in a size set by the precision and does not store
+  the precision, and `dynamical_sdp` cannot read one of another precision (its text checkpoint would mean writing
+  X and Y as text at every call below full precision). A call's precision is at least that of the generation it
+  starts from (`layout.json` `precision`; none: the problem's); before a call at a higher one the driver rewrites
+  that generation at it as the next generation, the limbs padded with zeros (`precision.convert_checkpoint`). So
+  mixed precision turned on for a run whose checkpoint is at full precision stays at full. A resume continues at
+  the last record's `precision_next`.
+- The generator is unchanged (its PMP is decimal text); `pmp2sdp`'s memory is measured again when the precision
+  rises.
+
 ## 11. Checkpoints, kept generations, resume
 
 - `dynamical_sdp`'s `--checkpointDir` is `<run>/checkpoint/` (all nodes share it). SDPB writes generation
@@ -388,7 +423,7 @@ directions the end points of two runs can differ by far more than N does.
   generations; any kill leaves the generation `checkpoint.json` names complete, but it may be a mid-call one.
 - So after each call, before writing its record k, bootlab makes `checkpoint/kept/<k>/`: hard links to that
   generation's rank files, copies of `checkpoint.json` and `block_timings`, and `layout.json` (`nodes`,
-  `node_type`, `ppn`, `generation`), built as `kept/<k>.new` and renamed. Older kept directories are removed
+  `node_type`, `ppn`, `precision`, `generation`), built as `kept/<k>.new` and renamed. Older kept directories are removed
   after the record is written, so at most three generations exist at any time and two after each record.
 - **Resume**: the largest `kept/<k>` with k ≤ the number of records; newer and unfinished ones are removed;
   in `checkpoint/` only the rank files of other generations are removed; the kept files are linked back. A
@@ -412,6 +447,8 @@ All numbers are full-precision decimal strings.
 | `procs`, `node`, `nodes` | processes per node; node 0; all nodes (several nodes) |
 | `pmp2sdp` | P, k, the measuring step, memory.peak, the node's memory rise |
 | `seconds` | `pmp`, `sdp`, `dive`; with several nodes also `copy`; `checkpoint` |
+| `precision` | bits of `pmp2sdp` and the solver in this call |
+| `precision_next`, `precision_note`, `call_iterations`, `first_call` | mixed precision only (10.1): the next call's bits, why they changed, this call's iterations, a cold start |
 
 `solves.jsonl` holds no times of day, so two runs with the same layout and block timings compare byte for
 byte.
@@ -493,7 +530,9 @@ with an address on that network). A host no rule matches stops the rank.
 ## 15. Probe and site generation
 
 `bootlab probe plan` (login node) → `probe node` jobs (one per type) and optionally `probe pair` jobs →
-`probe merge` → `bootlab site gen`.
+`probe merge` → `bootlab site gen`. `probe plan --partition P` reads only partition P (`sinfo -p`), sends the
+jobs there and records `partition` in plan.json; `site gen` then keeps only the probed node types and writes
+`[slurm] partition = P` (the hand file's `[slurm]` wins). `probe plan --node H` probes H, busy or not.
 
 | File | Content |
 |---|---|
@@ -546,3 +585,77 @@ outputs of the reference program's parameter checks (6 models, 14 cases).
 - **New measurements**: append rows to the bench files in the same form, with their source.
 - Tests: add unit tests under `tests/`; numerical changes need a regression (section 16) or a comparison of the
   same strength.
+
+<a id="local-mode"></a>
+## 18. Local mode (one machine without Slurm)
+
+bootlab runs on one Linux machine without Slurm (a workstation). The physics, the translation layer, the Skydive
+loop, the checkpoint and kept generations, resume and the records are the same as on a cluster; only the
+launcher, the resources and the memory watchdog differ. The README's
+[local-mode section](../../README.md#a-workstation-without-slurm-local-mode) has the commands.
+
+**Which launcher** (`execute.site_launcher`; `driver.log` records the choice and why):
+
+1. the site's `launcher` (`"slurm"` or `"local"`), else bootlab.toml's;
+2. else `slurm` when `SLURM_JOB_ID` is set (inside a job) or `sbatch` is on PATH;
+3. else `local`.
+
+**Starting programs** (`execute.local_argv`, `launch`):
+
+- every program in the image: `apptainer exec <binds> <sif> …`; the host needs apptainer only;
+- MPI programs through the image's own `mpirun` with a rankfile: rank i on cpu i of the list, physical cpu
+  numbers, `--bind-to hwthread`; the list is the first hardware thread of each physical core
+  (`execute.physical_cpus`), so a rank never shares a core and never uses a core's second thread;
+- concurrent programs (the `pmp2sdp` instances of a wave) get disjoint slices of that list, as `srun --exact`
+  steps do on a cluster;
+- the launcher sets `OMPI_MCA_plm=isolated` for every program (no rank is ever started through srun) and
+  removes the `SLURM_*`, `PMIX_*` and `PMI_*` variables; `UCX_TLS=self,sm` (shared memory only) comes from the
+  local site's `[env]`, written by `site gen`;
+- the generator is not MPI: it runs under the image's `taskset` on the whole list, with
+  `SLURM_JOB_NODELIST` set to this host (the one Slurm variable it gets), and its node list comes from the
+  image's `scontrol` stand-in;
+- programs run in the driver's process group (`submit` starts the driver in a session of its own); a rank that
+  fails ends its whole `mpirun` job.
+
+**Resources**: the physical cores of the machine (its affinity), and the memory available when the run starts
+(MemAvailable, at most the site's `mem_gb`), less `driver_reserve_mb`. No `--maxRuntime` is passed unless
+`[solver]` gives one; a run ends by its own rules or by `bootlab stop`.
+
+**The pmp2sdp watchdog without Slurm's cgroup** (`execute.build_sdps_local`; the rule of section 9 is
+unchanged: measure one instance at step 1, then k = ⌊memory ÷ (1.15 P)⌋, a wave cancelled at 95 % of an
+instance's share):
+
+| `memory_guard` | What is read | `measure` in solves.jsonl |
+|---|---|---|
+| `rss` (default) | the sum over the instance's process tree of `smaps_rollup`'s Pss_Anon + Pss_Shmem (shared pages counted once; without smaps_rollup the sum of RssAnon, which leaves shared memory out) | `pss` (or `rss_anon`) |
+| `systemd` (probe local sets it when it works) | the instance runs in a `systemd-run --user --scope` with `MemoryMax`/`MemoryHigh`; the scope's cgroup is read as on a cluster | `cgroup` |
+
+A cancelled wave gets SIGTERM, then SIGKILL; the step fails.
+
+**Commands** (the same names as on a cluster):
+
+| Command | Local meaning |
+|---|---|
+| `bin/bootlab probe local --sif <image> --out probe [--shared <dir>] [--local <dir>] [--sdp <small SDP>]` | this machine, directly, a few minutes: CPU and physical cores, memory, disks in bootlab's file pattern, the runs directory, apptainer and the image, `mpirun` on every core and two halves at once (each rank's binding recorded; with `--sdp` also `sdpb` on it), whether a systemd user scope can bound memory; writes `probe/node-<host>-local.json` and `probe/probe.json` |
+| `bin/bootlab site gen --probe probe/probe.json --hand <file> --out sites/<name>` | for a local probe: `launcher = "local"`, the machine as the one node type, no `[multinode]`, no IB, `[mpi] transport = "local"`, `UCX_TLS = "self,sm"`, the fastest scratch, `memory_guard`; the hand file may give `mem_gb` and `bench` |
+| `bin/bootlab submit <run.toml>` / `submit --resume <run dir>` | starts the driver in the background (`setsid nohup`; with `--systemd` as a transient user unit); its log under `<runs>/`; `<run dir>/driver.pid` holds its process group |
+| `bin/bootlab stop <run dir> [--wait <s>]` | while the solver runs, SIGTERM to its ranks only (not through `mpirun`, which would SIGKILL them a few seconds later): they write the checkpoint, the call ends `unfinished: SIGTERM signal received`, the driver records it and ends; otherwise SIGTERM to the driver's process group, and the resume does that step again from the last kept generation. `--wait` (default 600 s) waits for the driver's group to end. `submit --resume` refuses while the old driver's group still lives |
+| `bin/bootlab regress --wait` | runs the regression here in the foreground and prints PASS or FAIL (local mode only; on a cluster the job runs it and `--wait` is refused) |
+
+One local run at a time: the driver holds `<runs>/.local.lock`; a second `submit` says which run holds it.
+
+**Iteration counts of aborted calls** (both launchers): the record of an aborted call (SIGTERM, maxRuntime,
+maxIterations) carries the cumulative count including that call's own iterations, read from the solver's
+iteration table, so a run stopped and resumed counts its iterations like one that was not stopped. If the
+output has no iteration table the record says `iterations_unknown` with the reason; a resume goes on from the
+last known count and says so, and `regress check` names such a call. On a cluster, `scancel` kills the driver
+too: no aborted record is left, and the resume does the whole step again from the generation kept for the
+previous record, counted as before. Aborted records written before this rule (no iteration count and no
+`iterations_unknown`) are passed over by a resume, as before, without a warning.
+
+With `memory_guard = "systemd"`, a sample that cannot read the scope's cgroup is skipped (it does not fall back
+to Pss).
+
+**What has not been tested**: `memory_guard = "systemd"` and `submit --systemd` (unit tests cover the commands
+only), and a machine that really has no Slurm (the acceptance ran on a compute node with Slurm hidden). See the
+README's known limitations.

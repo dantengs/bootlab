@@ -199,16 +199,21 @@ def generate(probe: dict, hand: dict, mask: set) -> tuple:
     eth = next((n for n in records[0]["nics"] if n["type"] == "ethernet" and n["ipv4"]
                 and not n["ipv4"][0].startswith("169.254.")), None)
     paths = {k: hand[k] for k in ("sif", "python", "runs") if k in hand}   # left out: from bootlab.toml
+    # a probe of one partition (probe plan --partition): its jobs go there, and the site has the probed types only
+    partition = probe.get("plan", {}).get("partition")
+    slurm = {**({"partition": partition} if partition else {}), **hand.get("slurm", {})}
+    site_types = {t: v for t, v in types.items()
+                  if not partition or any(r["host"] in v["hosts"] for r in records)}
     site = {**paths, "binds": binds, "setup": "setup.sh",
             **IMAGE_PROGRAMS, "scratch": scratch, "scratch_basis": basis, "driver_reserve_mb": DRIVER_RESERVE_MB,
             "env_unset": ["OMPI_MCA_plm", "UCX_NET_DEVICES"],
-            "slurm": hand.get("slurm", {}),
+            "slurm": slurm,
             "env": {**MPI_ENV, "UCX_TLS": "rc,self,sm" if ib else "tcp,self,sm"},
             "mpi": {"transport": "ib" if ib else f"tcp-{(eth or {}).get('speed_mbps', 0) // 1000}g",
                     "net_devices": ["ib:auto"] if ib else ([f"subnet:{'.'.join(eth['ipv4'][0].split('.')[:3])}."] if eth else [])},
             **({"mpi_ib_exclude": hand.get("ib", {}).get("exclude", [])} if ib else {}),
             "node_types": {t: {"hosts": v["hosts"], "physical_cores": v["physical_cores"], "mem_gb": v["mem_mb"] // 1024}
-                           for t, v in types.items()}}
+                           for t, v in site_types.items()}}
     if "mpi_ib_exclude" in site:
         site["mpi"]["ib_exclude"] = site.pop("mpi_ib_exclude")
     routes = {(r["shared"].get("server_addr"), r["shared"].get("network")) for r in records}
@@ -254,11 +259,55 @@ def generate(probe: dict, hand: dict, mask: set) -> tuple:
     return site, notes, report
 
 
+def generate_local(probe: dict, hand: dict) -> tuple:
+    """A site for one machine without Slurm (probe local): launcher local, the machine
+    its one node type, no [multinode], no IB; MPI of the image on shared memory (UCX self,sm); scratch the
+    fastest measured (the runs directory or a local disk); memory_guard systemd when a user scope could
+    bound memory, else rss. (site, notes, report lines)."""
+    records = node_records(probe)
+    r = records[0]
+    scratch, basis, lines = choose_scratch(records)
+    measured = sorted({(x["shared"].get("where") or {}).get("realpath") or x["shared"]["path"] for x in records})
+    basis += f"; shared measured in {', '.join(measured)}"
+    m, g = r["mpi"], r["memory_guard"]
+    report = [f"local probe of {r['host']}: {len(r['physical_cpus'])} physical cores, memory {r['memory_mb']} MB"]
+    report += lines + [basis]
+    report.append(f"mpirun of the image on every core: {'ok' if m['ok'] else 'FAILED'} "
+                  f"({sum(x['ok'] for x in m['full'])} of {len(m['full'])} full, "
+                  f"{sum(x['ok'] for x in m['halves'])} of {len(m['halves'])} two halves at once"
+                  + (f", sdpb {sum(x['exit'] == 0 for x in m['sdpb'])} of {len(m['sdpb'])}" if "sdpb" in m else "")
+                  + ")")
+    report.append(f"memory guard: {'systemd' if g['available'] else 'rss'} ({g['why']})")
+    paths = {k: hand[k] for k in ("sif", "python", "runs") if k in hand}
+    site = {**paths, "launcher": "local", "binds": [scratch.split("/$USER")[0]] if scratch != "shared" else [],
+            "setup": "setup.sh", **IMAGE_PROGRAMS, "scratch": scratch, "scratch_basis": basis,
+            "driver_reserve_mb": DRIVER_RESERVE_MB, "memory_guard": "systemd" if g["available"] else "rss",
+            "shared_measured_at": measured, "env_unset": ["OMPI_MCA_plm", "UCX_NET_DEVICES"],
+            "env": {**MPI_ENV, "UCX_TLS": "self,sm"}, "mpi": {"transport": "local"},
+            "node_types": {t: {"hosts": v["hosts"], "physical_cores": v["physical_cores"], "mem_gb": v["mem_mb"] // 1024}
+                           for t, v in probe["types"].items()}}
+    if "mem_gb" in hand:
+        site["mem_gb"] = hand["mem_gb"]
+    if "bench" in hand:
+        site["bench"] = hand["bench"]
+    notes = {"launcher": "probe local: no Slurm on this machine", "scratch": "the fastest measured (scratch_basis)",
+             "memory_guard": "the pmp2sdp memory watchdog: rss or a systemd user scope",
+             "shared_measured_at": "the start warns when the runs directory is not in one of them"}
+    if not m["ok"]:
+        report.append("warning: mpirun on every core failed: the site is written, a run will fail at its first MPI program")
+    return site, notes, report
+
+
 def cmd_gen(args):
     probe = json.loads(Path(args.probe).read_text())
     hand = tomllib.loads(Path(args.hand).read_text())
     mask = set(filter(None, (args.mask or "").split(",")))
-    site, notes, report = generate(probe, hand, mask)
+    if probe["plan"].get("what") == "local":       # probe local: one machine without Slurm
+        if mask:
+            raise SystemExit("--mask is for a cluster's probe")
+        site, notes, report = generate_local(probe, hand)
+    else:
+        site, notes, report = generate(probe, hand, mask)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     head = (f"# Generated by bootlab site gen from {args.probe} and {args.hand}"

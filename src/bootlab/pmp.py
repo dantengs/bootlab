@@ -53,9 +53,8 @@ def generate(site, node, request: Path, log: Path) -> float:
     its path there, a script that sets the generator's libraries and its scalar_blocks script and starts it;
     its workers are processes of the same container. Returns its wall time."""
     t = time.time()
-    cmd = execute.srun_argv(site, [site.generator, "pmp", request], 1, node.cores,
-                            node.mem_mb - site.driver_reserve_mb, mpi=False, container=True, hosts=node.solo())
-    code = execute.start(cmd, log).wait()
+    code = execute.launch(site, node, [site.generator, "pmp", request], 1, node.cores,
+                          node.mem_mb - site.driver_reserve_mb, False, log, hosts=node.solo()).wait()
     if code != 0:
         raise execute.StepFailed(f"generator exit {code}")
     return time.time() - t

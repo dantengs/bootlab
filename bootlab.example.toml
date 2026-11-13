@@ -13,6 +13,10 @@ image = "/path/to/bootlab-exec.sif"
 # variable BOOTLAB_RUNS overrides every other setting.
 runs = "runs"
 
+# How the programs start, when the site does not say: "slurm" or "local" (a machine without Slurm). Left out:
+# slurm inside a Slurm job or where sbatch is on PATH, local otherwise.
+# launcher = "local"
+
 # The driver's Python (>= 3.11), when the site has none (default: python/bin/python3 in the install root, the
 # Python copied out of the image, when it exists).
 # python = "python/bin/python3"

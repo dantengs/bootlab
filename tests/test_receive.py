@@ -46,13 +46,15 @@ class Receive(unittest.TestCase):
         return th, ports[0]
 
     def send(self, port, token, data):
-        """A refused connection may be reset under the sender (Windows), which is the point."""
+        """A refused connection may be reset under the sender, which is the point: ConnectionReset on Windows, and
+        ENOTCONN from shutdown when the receiver closed first (a fast machine; it is an OSError, not a
+        ConnectionError)."""
         try:
             with socket.create_connection(("127.0.0.1", port)) as c:
                 c.sendall(token.encode() + data)
                 c.shutdown(socket.SHUT_WR)
                 c.recv(1)
-        except ConnectionError:
+        except OSError:
             pass
 
     def test_right_copy(self):

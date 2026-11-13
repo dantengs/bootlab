@@ -91,6 +91,9 @@ Useful options:
   `/var/tmp`). Use it
   for a scratch directory that is not a mount point of its own.
 - `--types a,b`: only these node types.
+- `--partition P`: only the nodes of Slurm partition P; the jobs go to it, and the generated site has only the
+  node types probed there and `[slurm] partition = "P"`.
+- `--node H`: a node probe on H (its type only), even when H is busy: the job waits for it.
 - Without `--submit` it only prints the `sbatch` commands and writes `probe/plan.json`.
 
 Each node job writes `probe/node-<host>-<job>.json` and `probe/slurm-probe-node-<job>.out`. It measures, among
@@ -410,12 +413,18 @@ of `pmp2sdp` instances at once is measured in the run's first step (the peak mem
 generated site has no bench of its own; point to measurements with `bench = ...` in the hand file. The format is
 in [interfaces](interfaces.md#bench-files).
 
-These defaults are safe and need no measurements. To get better layouts, measure your problem: run one step
-(`max_steps = 1`) of your model at your Λ with a few process counts per node (for example 64, 128 and all
-cores; seconds per iteration = `seconds.dive` ÷ `iterations` of the step's line in `solves.jsonl`), and once on two nodes if
-you have InfiniBand, then write the rows into `sites/<site>/bench/<node type>.json` with `model`, `lambda`,
-`N`, `blocks`, `nodes`, `procs_per_node` and `s_per_iter`. A `bootlab bench` command that does this is on the
-roadmap.
+These defaults are safe and need no measurements. For better layouts, measure your own problem on the node
+type you will run on:
+
+```bash
+bin/bootlab bench mymodel/run.toml [--node H] [--time 02:00:00]
+```
+
+One whole-node job: the SDP of the run's start point, then `sdpb` on all physical cores and on half of them,
+12 iterations each; the steady seconds per iteration (from the 4th iteration on) become `solver` rows of
+`sites/<site>/bench/<node type>.json`, with the machine's configuration as their source. Later runs of the
+same model and Λ use the faster count. The table's times are whole seconds, so the measure is coarse when an
+iteration takes under a second. Rows for several nodes are not measured by this command.
 
 ## 10. When something goes wrong
 

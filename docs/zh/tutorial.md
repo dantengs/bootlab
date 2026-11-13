@@ -80,6 +80,8 @@ gpu96: 2 nodes, 96 physical cores, 1031000 MB; not enough idle nodes for a node 
 - `--local <目录>`（可重复）：在常规候选（`$TMPDIR`、`$SLURM_TMPDIR`、本地块设备的挂载点、`/scratch`、`/local`、`/localscratch`、`/tmp`、
   `/var/tmp`）之外，再试一个节点本地目录做 scratch。本地 scratch 目录本身不是挂载点时要用它。
 - `--types a,b`：只测这几种型号。
+- `--partition P`：只用 Slurm 分区 P 里的节点，作业也交到 P；生成的站点只含在那里探测过的型号，`[slurm] partition = "P"`。
+- `--node H`：在节点 H 上做单节点探测（只测它的型号），H 正忙也行，作业会排队等它。
 - 不加 `--submit`：只打印 `sbatch` 命令、写 `probe/plan.json`。
 
 每个节点作业写出 `probe/node-<主机>-<作业号>.json` 和 `probe/slurm-probe-node-<作业号>.out`。测的项目包括：物理核、内存、InfiniBand
@@ -370,10 +372,15 @@ nodes = "auto"                 # 或者同一型号的主机列表
 节点数。没有 bench 时，求解器用一台节点的全部物理核，同时跑几个 `pmp2sdp` 由运行第一步实测（一个实例的内存峰值）决定。生成的站点没有
 自己的 bench，要在手写文件里用 `bench = ...` 指向已有的实测数据。格式见[接口文档](interfaces.md#bench-files)。
 
-这些默认值是稳妥的，不需要任何实测。想要更好的布局，就实测你自己的问题：在你的 Λ 下用你的模型跑一步（`max_steps = 1`），每节点试几种
-进程数（例如 64、128 和全部物理核；每次迭代的秒数 = `solves.jsonl` 里这一步的 `seconds.dive` ÷ `iterations`），有 InfiniBand 时再在两台节点上跑一次，
-然后把结果按 `model`、`lambda`、`N`、`blocks`、`nodes`、`procs_per_node`、`s_per_iter` 写进 `sites/<站点>/bench/<节点型号>.json`。
-自动完成这件事的 `bootlab bench` 命令在路线图里。
+这些默认值是稳妥的，不需要任何实测。想要更好的布局，就在你要用的节点型号上实测你自己的问题：
+
+```bash
+bin/bootlab bench mymodel/run.toml [--node H] [--time 02:00:00]
+```
+
+它交一个整机作业：生成运行起点的 SDP，再用全部物理核和一半物理核各跑 12 次 `sdpb` 迭代，取第 4 次以后的稳态每次迭代秒数，作为 `solver` 行写进
+`sites/<站点>/bench/<节点型号>.json`，来源只写机器配置。之后同一模型、同一 Λ 的运行会用较快的那个进程数。迭代表的时间是整秒，所以每次迭代不到
+一秒时这个数偏粗。多节点的记录这个命令不测。
 
 ## 10. 出了问题怎么办
 

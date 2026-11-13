@@ -136,7 +136,7 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
                 mock.patch.object(skydive.execute, "job_seconds_left", lambda: 10 ** 6):
             for n in range(1, n_steps + 1):
                 with self.assertRaises(Stop):
-                    r.step(n, x, {"gap_threshold": "1e-30"}, 128)
+                    r.step(n, x, {"gap_threshold": "1e-30", "precision": p.solver_precision()}, 128)
         return calls, r, (run_dir / "driver.log").read_text()
 
     def test_l23_amd1(self):
@@ -213,9 +213,11 @@ class Loop(unittest.TestCase):
             (self.dir / name).write_text(name)
 
     def run_loop(self, dives, max_steps, state=None, first_only=False, track=None, kappa=None, tighten=None,
-                 boundary=False):
+                 boundary=False, mixed=False):
         p = inputs.load(EXAMPLE)
         p.run["skydive"]["max_steps"] = max_steps
+        if mixed:
+            p.run["skydive"]["mixed_precision"] = True
         if boundary:                    # finding the boundary from the first step
             p.run["skydive"]["find_boundary_direction"] = ["0", "1", "0"]
             p.run["skydive"]["find_boundary_when_allowed"] = False
@@ -233,6 +235,7 @@ class Loop(unittest.TestCase):
 
         def step(n, x, st, procs):
             seen.append((n, dict(x), dict(st)))
+            (self.dir / "steps" / str(n)).mkdir(parents=True, exist_ok=True)
             if dives[n - 1] is None:
                 raise execute.StepFailed("pmp2sdp exit 1")
             sdir = r.scratch / f"step_{n}"
@@ -250,7 +253,7 @@ class Loop(unittest.TestCase):
                 (r.ck / f"checkpoint_{n}_{rank}").write_text(f"after step {n}")
             (r.ck / "checkpoint.json").write_text(json.dumps({"current": n, "backup": n - 1}))
             (r.ck / "block_timings").write_text("1\n")
-            r.keep_generation(4)
+            r.keep_generation(4, st["precision"])
             return dives[n - 1], 4, {}, sdir, nsv
 
         s = state or skydive.start_state(p)
@@ -271,7 +274,7 @@ class Loop(unittest.TestCase):
                          ["block_timings", "checkpoint.json"] + [f"checkpoint_{n}_{r}" for r in range(4)] + ["layout.json"])
         self.assertTrue(os.path.samefile(k / f"checkpoint_{n}_3", ck / f"checkpoint_{n}_3"))
         self.assertEqual(json.loads((k / "layout.json").read_text()),
-                         {"nodes": ["h-1"], "node_type": "h", "ppn": 4, "generation": n})
+                         {"nodes": ["h-1"], "node_type": "h", "ppn": 4, "precision": 785, "generation": n})
 
     def test_converged(self):
         """Optimal with primal and dual both negative: converged, allowed; N null, primal/dual/gap recorded."""
@@ -296,6 +299,40 @@ class Loop(unittest.TestCase):
         self.assertEqual((res["status"], res["reason"], res["navigator"]), ("converged", "excluded", None))
         self.assertTrue((self.dir / "endpoint" / "pmp" / "labels.json").exists())
         self.assertFalse((self.dir / "checkpoint").exists())
+
+    def test_mixed_precision_ends_at_full(self):
+        """Mixed precision (Ising Lambda 11: 785 bits; gap upper limit 0.1): 512 bits from the start, not lowered
+        at the made-up gap 2; an optimal call at 512 bits decides nothing: the same point at 785 bits, with the same
+        BFGS state, decides."""
+        _, seen, res = self.run_loop([stepped(1), stepped(2), optimal("-1.1e-11", "-1.2e-11"),
+                                      optimal("-1.1e-11", "-1.2e-11")], 10, mixed=True)
+        self.assertEqual([st["precision"] for _, _, st in seen], [512, 512, 512, 785])
+        self.assertEqual(seen[3][1], seen[2][1])
+        self.assertEqual(seen[3][2]["prev_hessian"], seen[2][2]["prev_hessian"])
+        self.assertEqual((res["status"], res["reason"], res["steps"]), ("converged", "allowed", 3))
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([(l["step"], l["precision"], l["precision_next"]) for l in lines],
+                         [(1, 512, 512), (2, 512, 512), (3, 512, 785), (3, 785, 785)])
+        self.assertEqual((lines[0].get("first_call"), lines[1].get("first_call"), lines[1]["call_iterations"]),
+                         (True, None, 100))
+        self.assertIn("optimal at 512 bits", lines[2]["precision_note"])
+        self.assertTrue((self.dir / "steps" / "3-512bits").is_dir())
+
+    def test_mixed_precision_health_check(self):
+        """findMinimumQ changing at 512 bits: full precision from the next call on, never lowered again."""
+        d3 = stepped(3)
+        d3.find_minimum = True
+        _, seen, _ = self.run_loop([stepped(1), stepped(2), d3, stepped(4), stepped(5)], 5, mixed=True)
+        self.assertEqual([st["precision"] for _, _, st in seen], [512, 512, 512, 785, 785])
+        s = skydive.resume_state(inputs.load(EXAMPLE), self.dir, hot=True)
+        self.assertEqual(s["bfgs"]["precision"], 785)
+
+    def test_mixed_precision_off(self):
+        """Without mixed_precision: the problem's precision at every call, no precision_next."""
+        _, seen, _ = self.run_loop([stepped(1), stepped(2)], 2)
+        self.assertEqual([st["precision"] for _, _, st in seen], [785, 785])
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([("precision_next" in l, l["precision"]) for l in lines], [(False, 785), (False, 785)])
 
     def test_undecided_at_optimal(self):
         """Optimal with objectives of opposite signs: stopped, checkpoint/ kept as for unfinished, no endpoint/;

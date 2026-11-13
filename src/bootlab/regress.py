@@ -57,8 +57,16 @@ def compare(ours: dict, ref: dict) -> dict:
 
 
 def check(run: Path, reference: Path = REFERENCE, min_digits: float = MIN_DIGITS) -> tuple:
-    """(passed, report lines, report dict) of a run against the reference."""
-    ours = run_steps(run)
+    """(passed, report lines, report dict) of a run against the reference: each step's last record (a run
+    stopped and resumed has the stopped call's record too); a call whose iterations are unknown is named, and
+    so is an iteration count that differs after it."""
+    every = run_steps(run)
+    last = {}
+    for r in every:
+        last[r["step"]] = r
+    ours = [last[s] for s in sorted(last)]
+    stopped = [r for r in every if r["verdict"] == "aborted" and r is not last[r["step"]]]
+    unknown = [r for r in every if r.get("iterations_unknown")]
     ref = json.loads(Path(reference).read_text())["steps"]
     by_step = {r["step"]: r for r in ref}
     rows = [compare(o, by_step[o["step"]]) for o in ours if o["step"] in by_step]
@@ -69,8 +77,15 @@ def check(run: Path, reference: Path = REFERENCE, min_digits: float = MIN_DIGITS
     lines += [" ".join(f"{str(r.get(c, '')).replace('same', '=')[:9]:>9}" for c in cols) for r in rows]
     worst = {c: least([r[c] for r in rows if c in r]) for c in ["x", "navigator", "ext_step", "gradient", "hessian"]}
     lines.append("least digits: " + json.dumps(worst))
+    lines += [f"step {r['step']}: a call ended ({r['reason']}) and the step was done again; its iterations "
+              + (f"unknown: {r['iterations_unknown']}" if r.get("iterations_unknown") else f"counted: {r.get('iterations')}")
+              for r in stopped]
     bad = [f"step {r['step']} {k}: {v}" for r in rows for k, v in r.items() if k != "step"
            and (v != "same" if k in EXACT else v != "all" and v < min_digits)]
+    if unknown:
+        first = min(r["step"] for r in unknown)
+        bad = [b + (f" (step {first} has a call with its iterations unknown: the counts from there leave it out)"
+                    if " iterations:" in b and int(b.split()[1]) >= first else "") for b in bad]
     if len(rows) < len(ref):
         bad.append(f"{len(rows)} steps compared, the reference has {len(ref)}")
     lines.append("FAIL\n" + "\n".join(bad) if bad else f"PASS: {len(rows)} steps, every number to {min_digits} digits or more")
