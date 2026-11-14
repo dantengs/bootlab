@@ -249,6 +249,10 @@ def check_run_numbers(run, coords) -> list:
         errors.append(f"run.toml [skydive] mixed_precision = {o['mixed_precision']!r} is not true or false: true runs "
                       "the solver and pmp2sdp at the lowest precision that keeps enough digits and ends the run at "
                       "the problem's own (precision.py); false (the default) keeps the problem's at every call")
+    if not isinstance(o.get("large_steps", False), bool):
+        errors.append(f"run.toml [skydive] large_steps = {o['large_steps']!r} is not true or false: true takes the "
+                      "next point up to 8 solver steps ahead on straight stretches of the path (jump.py); false (the "
+                      "default) takes the solver's step")
     eps = o.get("infinitesimal")
     if isinstance(eps, (int, str)) and _exact(eps) and frac(eps) < frac(INFINITESIMAL_MIN):
         errors.append(f"run.toml [skydive] infinitesimal {eps} is below {INFINITESIMAL_MIN}: the generator keys and "

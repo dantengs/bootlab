@@ -13,7 +13,7 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from . import bench, execute, inputs, pmp, precision
+from . import bench, execute, inputs, jump, pmp, precision
 from .numbers import decimal_text, frac
 
 # The options of dynamical_sdp that bt r3.8 passes when the parameter file leaves them out: upstream's
@@ -341,6 +341,7 @@ class Run:
         direction = [str(v) for v in o.get("find_boundary_direction", [])]
         guess = o.get("hessian_guess", [])
         mixed = o.get("mixed_precision", False)
+        jumps = o.get("large_steps", False)
         full = self.p.solver_precision()
         while True:
             if n >= o["max_steps"]:
@@ -387,9 +388,25 @@ class Run:
                     "boundary_on": bool(state["boundary_direction"]),
                     "procs": procs, **self.where(), "seconds": seconds, "pmp2sdp": self.sdp_mem,
                     "precision": state["precision"]}
-            if mixed:
-                line.update(self.precision_fields(line, dive, state, full))
+            if mixed or jumps:
+                sj = self.dir / "solves.jsonl"
+                history = [json.loads(l) for l in sj.read_text().splitlines() if l.strip()] if sj.exists() else []
+                line["call_iterations"] = (dive.iterations - state["total_iterations"] if dive.iterations is not None
+                                           else dive.call_iterations)
+                if state.get("first_call"):
+                    line["first_call"] = True
+                if jumps and dive.verdict == "stepped":
+                    line.update(jump.decide(line, history))
+                    if line["jump"] > 1 and not in_box(moved(x, dive.ext_step, line["jump"]), box_min, box_max):
+                        line["jump_note"] += f"; {line['jump']} steps ahead would leave the box: 1"
+                        line["jump"] = 1
+                    self.log(f"step {n + 1}: large steps: {line['jump_note']}; next point {line['jump']} steps ahead"
+                             + (f"; stops: {line['jump_stop']}" if "jump_stop" in line else ""))
+                if mixed:
+                    line.update(self.precision_fields(line, history, full))
             self.record(line)
+            if "jump_stop" in line:
+                return self.finish("stopped", f"stopped: {line['jump_stop']}", x, n + 1, dive.navigator, dive)
             if dive.verdict == "aborted":
                 self.keep_checkpoint()
                 return self.finish("unfinished", dive.reason, x, n)
@@ -411,14 +428,15 @@ class Run:
                 if reason == "boundary":        # N reported as 0, |N| <= the gap
                     return self.finish(status, reason, x, n + 1, "0", dive, n_bound=dive.gap)
                 return self.finish(status, reason, x, n + 1, None, dive)
-            x_next = {c: decimal_text(frac(x[c]) + frac(s)) for c, s in zip(self.p.coords, dive.ext_step)}
+            step = scaled(dive.ext_step, line.get("jump", 1))     # the solver's step, or m times it (large steps)
+            x_next = moved(x, dive.ext_step, line.get("jump", 1))
             negative = frac(dive.navigator) < 0
             if o.get("stop_on_negative", False) and negative:
                 return self.finish("stopped", "stopped: negative navigator", x_next, n + 1, dive.navigator, dive)
-            if not all(lo <= frac(x_next[c]) <= hi for c, lo, hi in zip(self.p.coords, box_min, box_max)):
+            if not in_box(x_next, box_min, box_max):
                 return self.finish("stopped", "stopped: left box", x, n + 1, dive.navigator, dive)
             boundary_on = boundary_on or bool(direction and negative)
-            bfgs = {"total_iterations": dive.iterations, "prev_step": dive.ext_step,
+            bfgs = {"total_iterations": dive.iterations, "prev_step": step,
                     "prev_gradient": dive.gradient, "prev_hessian": [h for row in dive.hessian for h in row],
                     "prev_navigator": dive.navigator, "first_navigator": bfgs.get("first_navigator", dive.navigator),
                     "precision": line.get("precision_next")}
@@ -426,16 +444,11 @@ class Run:
             execute.on_hosts(self.site, self.node, f"rm -rf {sdir}", self.node.others)
             x, n = x_next, n + 1
 
-    def precision_fields(self, line: dict, dive, state: dict, full: int) -> dict:
-        """A mixed precision record's call_iterations (None when unknown), first_call (a cold start; left out
-        when not), precision_next and precision_note (why it is not this call's; left out when it is)."""
-        f = {"call_iterations": dive.iterations - state["total_iterations"] if dive.iterations is not None
-             else dive.call_iterations}
-        if state.get("first_call"):
-            f["first_call"] = True
-        sj = self.dir / "solves.jsonl"
-        history = [json.loads(l) for l in sj.read_text().splitlines() if l.strip()] if sj.exists() else []
-        nxt, note = precision.next_precision({**line, **f}, history, full)
+    def precision_fields(self, line: dict, history: list, full: int) -> dict:
+        """A mixed precision record's precision_next and precision_note (why it is not this call's; left out when
+        it is); line has call_iterations and first_call, history the records before it."""
+        f = {}
+        nxt, note = precision.next_precision(line, history, full)
         f["precision_next"] = nxt
         if note:
             f["precision_note"] = note
@@ -461,6 +474,20 @@ class Run:
         if self.node.others:          # x_<block>.txt are written where the blocks' ranks run
             execute.gather(self.site, self.node, out_dir)
         shutil.copytree(out_dir, end / "out", dirs_exist_ok=True)
+
+
+def scaled(ext_step: list, m: int) -> list:
+    """m times the solver's step, as decimal strings (the step itself when m = 1)."""
+    return ext_step if m == 1 else [decimal_text(m * frac(s)) for s in ext_step]
+
+
+def moved(x: dict, ext_step: list, m: int) -> dict:
+    """x + m dx, coordinate by coordinate (x's order is the coordinates' and ext_step's)."""
+    return {c: decimal_text(frac(v) + frac(s)) for (c, v), s in zip(x.items(), scaled(ext_step, m))}
+
+
+def in_box(x: dict, box_min: list, box_max: list) -> bool:
+    return all(lo <= frac(v) <= hi for v, lo, hi in zip(x.values(), box_min, box_max))
 
 
 def ending(status: str, reason: str, n_bound=None) -> str:
@@ -513,7 +540,7 @@ def resume_state(problem, run_dir: Path, hot: bool) -> dict:
     # a failed step's line has no boundary_on (a resume after one once stopped at KeyError)
     boundary_on = any(l.get("boundary_on", False) for l in lines) or any(direction and frac(l["navigator"]) < 0 for l in stepped)
     if last["verdict"] == "stepped":
-        x = {c: decimal_text(frac(v) + frac(s)) for c, v, s in zip(problem.coords, last["x"], last["ext_step"])}
+        x = moved(dict(zip(problem.coords, last["x"])), last["ext_step"], last.get("jump", 1))
         ref, n = last, last["step"]
     else:
         x = dict(zip(problem.coords, last["x"]))
@@ -521,7 +548,7 @@ def resume_state(problem, run_dir: Path, hot: bool) -> dict:
     total, warning = resume_iterations(lines)
     bfgs = {"total_iterations": total, "first_call": not hot}
     if ref:
-        bfgs.update({"prev_step": ref["ext_step"],
+        bfgs.update({"prev_step": scaled(ref["ext_step"], ref.get("jump", 1)),
                      "prev_gradient": ref["gradient"], "prev_hessian": [h for row in ref["hessian"] for h in row],
                      "prev_navigator": ref["navigator"],
                      "first_navigator": stepped[0]["navigator"]})    # N_1, for gap_upper_limit_track

@@ -197,6 +197,13 @@ def optimal(primal: str, dual: str) -> execute.Dive:
                         gap=str(abs(float(primal) - float(dual))), ext_step=["0", "0", "0"], iterations=1)
 
 
+def jumped(n: int, cumulative: int) -> execute.Dive:
+    """stepped(n) with alpha_d 0.05 and the cumulative iterations given."""
+    d = stepped(n)
+    d.alpha_d, d.iterations = "0.05", cumulative
+    return d
+
+
 class Loop(unittest.TestCase):
     """The loop's endings and records, and a resume, with made-up steps in place of the programs."""
 
@@ -213,11 +220,13 @@ class Loop(unittest.TestCase):
             (self.dir / name).write_text(name)
 
     def run_loop(self, dives, max_steps, state=None, first_only=False, track=None, kappa=None, tighten=None,
-                 boundary=False, mixed=False):
+                 boundary=False, mixed=False, jumps=False):
         p = inputs.load(EXAMPLE)
         p.run["skydive"]["max_steps"] = max_steps
         if mixed:
             p.run["skydive"]["mixed_precision"] = True
+        if jumps:
+            p.run["skydive"]["large_steps"] = True
         if boundary:                    # finding the boundary from the first step
             p.run["skydive"]["find_boundary_direction"] = ["0", "1", "0"]
             p.run["skydive"]["find_boundary_when_allowed"] = False
@@ -333,6 +342,49 @@ class Loop(unittest.TestCase):
         self.assertEqual([st["precision"] for _, _, st in seen], [785, 785])
         lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
         self.assertEqual([("precision_next" in l, l["precision"]) for l in lines], [(False, 785), (False, 785)])
+
+    def test_large_steps(self):
+        """Large steps (alpha 0.05, a straight path): step 2 sends the next point 8 steps ahead and 8 dx as the BFGS
+        step; step 3 took 30 iterations after it (over 13.5): 1 step for 2 calls; then 8 again. The records keep
+        the solver's step; a resume goes on 8 steps ahead of the last point."""
+        d = [jumped(1, 100), jumped(2, 103), jumped(3, 133), jumped(4, 136), jumped(5, 139), jumped(6, 142)]
+        _, seen, res = self.run_loop(d, 6, jumps=True)
+        self.assertEqual([s[1]["deltaSig"] for s in seen], ["0.519", "0.5191", "0.5199", "0.52", "0.5201", "0.5209"])
+        self.assertEqual(seen[2][2]["prev_step"], ["0.0008", "0", "0"])
+        self.assertEqual(seen[3][2]["prev_step"], ["1e-4", "0", "0"])
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([l["jump"] for l in lines], [1, 8, 1, 1, 8, 8])
+        self.assertIn("30 iterations after a step 8 times ahead", lines[2]["jump_note"])
+        self.assertEqual([l["ext_step"][0] for l in lines], ["1e-4"] * 6)
+        self.assertEqual(res["x"], ["0.5217", "1.4", "0.956"])
+        s = skydive.resume_state(inputs.load(EXAMPLE), self.dir, hot=True)
+        self.assertEqual((s["x"]["deltaSig"], s["bfgs"]["prev_step"][0]), ("0.5217", "0.0008"))
+
+    def test_large_steps_mode_change_stops(self):
+        d3 = jumped(3, 106)
+        d3.find_minimum = True
+        _, seen, res = self.run_loop([jumped(1, 100), jumped(2, 103), d3, jumped(4, 109)], 4, jumps=True)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual((res["status"], res["reason"]),
+                         ("stopped", "stopped: findMinimumQ changed after a step 8 times ahead"))
+        self.assertEqual(res["x"], ["0.5199", "1.4", "0.956"])
+
+    def test_large_steps_box(self):
+        """8 steps ahead would leave the box (deltaSig <= 0.530): 1 step."""
+        start = skydive.start_state(inputs.load(EXAMPLE))
+        start["x"]["deltaSig"] = "0.5295"
+        _, seen, _ = self.run_loop([jumped(1, 100), jumped(2, 103), jumped(3, 106)], 3, state=start, jumps=True)
+        self.assertEqual([s[1]["deltaSig"] for s in seen], ["0.5295", "0.5296", "0.5297"])
+
+    def test_large_steps_with_mixed_precision(self):
+        """Both on: the 30 iterations after the large step do not send mixed precision to full (the large step
+        has its own budget, jump.after_jump); 512 bits throughout."""
+        d = [jumped(1, 100), jumped(2, 103), jumped(3, 133), jumped(4, 136), jumped(5, 139)]
+        _, seen, _ = self.run_loop(d, 5, mixed=True, jumps=True)
+        self.assertEqual([s[2]["precision"] for s in seen], [512] * 5)
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([l["jump"] for l in lines], [1, 8, 1, 1, 8])
+        self.assertNotIn("precision_note", lines[2])
 
     def test_undecided_at_optimal(self):
         """Optimal with objectives of opposite signs: stopped, checkpoint/ kept as for unfinished, no endpoint/;

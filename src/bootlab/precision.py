@@ -6,8 +6,9 @@ The digits kept: about dec(P) - LOSS - 0.6 log10(1/gap), dec(P) = 0.30103 P. The
 and 83 (Lambda 27) digits with infinitesimal 1e-40; 68 with bootlab's 1e-20 (Ising
 Lambda 11: 384 bits agreed with 785 and with bt r3.8 to 47.5 digits at gap 0.08); at gap 6.8e-21
 the external steps at 384 and 512 bits agreed with 785 to 40.9 and 80.2 digits, N to 49 and 88: a loss of 62 by this
-formula, the gap term already more than the gap costs. So it hardly follows the infinitesimal or the gap; LOSS is
-above every measurement. The rule asks for MARGIN digits or more.
+formula; on a larger problem (N about 2300, 1024 bits full; gap 1.9e-14) 512 bits agreed with 1024 to 54.6 digits, a loss of 91. LOSS is the
+largest measured, 91, with some room: 95. The rule asks for MARGIN digits or more: 512 bits keep about 41 at a gap of
+1e-30, 384 bits are never chosen.
 
 The solver's binary checkpoint stores each number in a size fixed by the precision (Elemental's
 BigFloat::Serialize: int32 size, int64 exponent, then num_limbs 64-bit limbs, least significant first, the first
@@ -26,9 +27,11 @@ import struct
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+from . import jump
+
 LADDER = (384, 512, 768, 1024)
 MARGIN = 30
-LOSS = 85
+LOSS = 95
 
 
 def digits_kept(bits: int, gap) -> float:
@@ -45,18 +48,21 @@ def choose(full: int, gap) -> int:
 
 def health(line: dict, history: list):
     """Why the call of record `line` (after the records `history`) asks for full precision, or None: it was
-    aborted; findMinimumQ differs from the last stepped record's; or a call that neither climbed nor started cold
-    made more than max(4, 2 x the median of the last 5 such stepped calls) iterations (no check without such calls).
-    The navigator's sign is not checked (it changes near the boundary), climbing calls are not."""
+    aborted; findMinimumQ is True after a stepped record where it was False (the path left the allowed region: from
+    False to True; the other way, entering the region, is a Skydive run's usual path); or a call that
+    neither climbed, started cold nor
+    started a large step ahead (jump.after_jump) made more than max(4, 2 x the median of the last 5 such stepped
+    calls) iterations (no check without such calls). The navigator's sign is not checked (it changes near the
+    boundary), climbing calls are not, nor the recovery after a large step (its own budget)."""
     if line["verdict"] == "aborted":
         return f"aborted at {line['precision']} bits"
     stepped = [l for l in history if l["verdict"] == "stepped"]
-    if stepped and stepped[-1].get("find_minimum") != line["find_minimum"]:
-        return f"findMinimumQ changed to {line['find_minimum']}"
-    usual = [l["call_iterations"] for l in stepped
-             if not l.get("climbed") and not l.get("first_call") and l.get("call_iterations") is not None][-5:]
+    if stepped and not stepped[-1].get("find_minimum") and line["find_minimum"]:
+        return "findMinimumQ changed to True (left the allowed region)"
+    usual = [l["call_iterations"] for k, l in enumerate(history) if l["verdict"] == "stepped" and not l.get("climbed")
+             and not l.get("first_call") and not jump.after_jump(history, k) and l.get("call_iterations") is not None][-5:]
     it = line.get("call_iterations")
-    if usual and it is not None and not line["climbed"] and not line.get("first_call"):
+    if usual and it is not None and not line["climbed"] and not line.get("first_call")             and not jump.after_jump(history, len(history)):
         limit = max(4, 2 * statistics.median(usual))
         if it > limit:
             return f"{it} iterations, more than {limit:g} (2 x the median of the last {len(usual)} such calls)"

@@ -59,14 +59,14 @@ VALUES = [Fraction(1, 3), Fraction(-22, 7), Fraction(0), Fraction(10) ** 40 / 3,
 
 class Choice(unittest.TestCase):
     def test_ladder(self):
-        """A loss of 85 digits: 384 bits only above a gap of about 1 (30.6 digits at gap 1, 29.9 at 0.078, an Ising
-        Lambda 11 first step); 512 bits from there to the gap floor 1e-30 (51 digits); full when no rung below it
-        keeps 30 digits."""
-        self.assertEqual(precision.choose(785, "1"), 384)
+        """A loss of 95 digits: 384 bits never (20.6 digits at gap 1); 512 bits down to the gap floor 1e-30 (41
+        digits); full when no rung below it keeps 30 digits."""
+        self.assertEqual(precision.choose(785, "1"), 512)
         self.assertEqual(precision.choose(785, "0.0784"), 512)
         self.assertEqual(precision.choose(1024, "2.4e-11"), 512)
         self.assertEqual(precision.choose(1024, "1e-30"), 512)
-        self.assertAlmostEqual(precision.digits_kept(512, "1e-30"), 51.1, places=1)
+        self.assertAlmostEqual(precision.digits_kept(512, "1e-30"), 41.1, places=1)
+        self.assertEqual(precision.choose(1024, "1e-50"), 768)
         self.assertEqual(precision.choose(512, "1e-30"), 512)
         self.assertEqual(precision.choose(384, "1e-30"), 384)
 
@@ -113,8 +113,15 @@ class Health(unittest.TestCase):
     def test_no_history(self):
         self.assertIsNone(precision.health(stepped(50), [stepped(180, first=True)]))
 
-    def test_find_minimum(self):
-        self.assertIn("findMinimumQ", precision.health(stepped(2, find_minimum=True), self.HISTORY))
+    def test_find_minimum_leaving(self):
+        """False to True: the path left the allowed region."""
+        self.assertIn("left the allowed region", precision.health(stepped(2, find_minimum=True), self.HISTORY))
+
+    def test_find_minimum_entering(self):
+        """True to False: entering the region from a start outside it (the second step of such a run), even after several steps
+        outside."""
+        outside = [stepped(180, first=True, find_minimum=True), stepped(3, find_minimum=True)]
+        self.assertIsNone(precision.health(stepped(3), outside))
 
     def test_aborted_and_optimal(self):
         aborted = {"verdict": "aborted", "precision": 384, "gap": None, "call_iterations": 7}

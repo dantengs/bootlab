@@ -211,6 +211,7 @@ gap_upper_limit = "1e-12"                  # required
 # infinitesimal = "1e-20"                  # >= 1e-25
 # block_timings = "/abs/path/checkpoint/block_timings"   # a new run: another run's block costs, no timing run
 # mixed_precision = false                  # true: section 10.1
+# large_steps = false                      # true: section 10.2
 
 [solver]                                   # SDPB options by flag name, over skydive.solver_defaults(nmax)
 [dynamical]                                # dynamical_sdp's own options, over skydive.DYNAMICAL_DEFAULTS
@@ -394,15 +395,27 @@ directions the end points of two runs can differ by far more than N does.
 
 Off by default; `bin/bootlab regress` runs at full precision. The solver and `pmp2sdp` run at the lowest
 precision P of {384, 512, 768, 1024} below the problem's `solver_precision` with
-`0.30103·P − 85 − 0.6·log10(1/gap) ≥ 30` digits (the gap of the last record, `gap_upper_limit` at the start),
+`0.30103·P − 95 − 0.6·log10(1/gap) ≥ 30` digits (the gap of the last record, `gap_upper_limit` at the start),
 else at full precision. Never lowered. Basis (measured): 78 and 83 digits lost with `infinitesimal` 1e-40 at
 Λ = 23 and 27, whole steps 2.3–2.6 times faster at 384–512 bits there; 68 digits lost with 1e-20 at Ising Λ = 11
 (384 bits agreed with 785 bits and with the reference program to 47.5 digits); at gap 6.8e-21 the steps at 384
-and 512 bits agreed with 785 bits to 40.9 and 80.2 digits (62 lost by the formula). The rule gives 512 bits from a gap of about 1 down to 1e-30.
+and 512 bits agreed with 785 bits to 40.9 and 80.2 digits (62 lost by the formula); on a larger problem (N ≈ 2300,
+about 220 blocks, 1024 bits full) at gap 1.9e-14, 512 bits agreed with 1024 to 54.6 digits (91 lost). The loss is the largest measured, 91, with some room: 95. The rule gives 512 bits from a gap of 1 down to
+1e-30 (41 digits there); 384 bits are never chosen.
 
-- **Health check** below full precision (full from the next call on): the call aborted; `findMinimumQ`
-  differs from the last stepped call's; a call that neither climbed nor started cold made more than
-  max(4, 2 × the median of the last 5 such calls) iterations. N's sign is not checked.
+What it saves is the solver's iterations, so the gain is their share of a whole step. At Λ = 23 and 27 with 1024
+bits full they are most of a step (the 2.3–2.6 above). At Ising Λ ≤ 19 (785 bits full, 3 iterations a step) they
+are about a fifth: at Λ = 19, steps 2–40, the iterations took 546 s at 785 bits and 344 s at 512, while the
+generator (559 s), `pmp2sdp` (342 s), the solver's start (688 s) and loading and saving (420 s) did not change; the
+gain is lost in the differences between two nodes. In bootlab, on a larger problem (N ≈ 2300, about 220 blocks,
+1024 bits full), steps 2–6 at 512 bits were 1.27 times faster as whole steps: the iterations about 1.6 times, while the
+generator and `pmp2sdp` took about 220 s a step at either precision. So a whole step in bootlab gains less than the
+2.3–2.6 above, which were measured with the generation at the lower precision too.
+
+- **Health check** below full precision (full from the next call on): the call aborted; `findMinimumQ` is
+  true after a stepped call where it was false (the path left the allowed region; from true to false, entering it,
+  is the usual path of a run started outside); a call that neither climbed, started cold nor started a large step ahead
+  (10.2) made more than max(4, 2 × the median of the last 5 such calls) iterations. N's sign is not checked.
 - **End**: an `optimal` call below full precision decides nothing; the same point with the same BFGS state is
   solved again at full precision (its logs go to `steps/<n>-<P>bits/`), and that call decides. The endpoint and
   the EFM are at full precision.
@@ -415,6 +428,30 @@ and 512 bits agreed with 785 bits to 40.9 and 80.2 digits (62 lost by the formul
   the last record's `precision_next`.
 - The generator is unchanged (its PMP is decimal text); `pmp2sdp`'s memory is measured again when the precision
   rises.
+
+### 10.2 Large steps (`large_steps = true`)
+
+Off by default. The next point is x + m·Δx instead of x + Δx, m chosen after each stepped call from its record
+and the stepped record before it (`jump.py`; rules taken unchanged from earlier research runs). An external step's length is set by the gap, not by how far
+the boundary is; on a straight stretch of the path a point m steps ahead costs about 1.2 more iterations a step,
+against a whole call's fixed cost.
+
+- c = cos(Δx/α, the previous Δx/α), α = `alpha_d`. m = 1 while cooling down, when c ≤ 0.99 or the call climbed;
+  2 when c ≤ 0.999; else ⌊0.5/α⌋ within [1, 8]; 1 when x + m·Δx leaves the box.
+- After a call that started m > 1 steps ahead: `findMinimumQ` changed → `stopped: findMinimumQ changed after a
+  step m times ahead`; N changed sign → no more large steps in this run; more than 3 + 1.5(m − 1) iterations, or
+  c < 0.98 → m = 1 for the next 2 calls.
+- The BFGS step passed on is m·Δx; the record keeps the solver's Δx (`ext_step`) with `jump` = m; a resume goes
+  on from x + m·Δx.
+- With mixed precision: the call after a large step has its own iteration budget, not the health check's.
+- Measured (a larger problem, N ≈ 3000 and about 270 blocks; 13 h each from the same start): 1.84 times the
+  progress without at 1024 bits.
+  Every point is still one the solver converged at: a bad large step costs time, not the result.
+- In bootlab, on the larger problem of 10.1 (N ≈ 2300; 512 bits, 5 steps): 3.45 times the progress an hour without large steps,
+  4.3 times that of full precision without; m was 1, 3, 6, 4, 3, no cooldown. Few steps: a reference only.
+- **Known limitation**: after N changes sign the run takes no more large steps, even when the change is brief. At
+  512 bits (same problem and start) the gain was 1.32 times in 13 h: N changed sign briefly at record 27 and back
+  at the next, and the large steps ended there, 4.5 h in. A cooldown instead waits for longer runs to try it.
 
 ## 11. Checkpoints, kept generations, resume
 
@@ -449,6 +486,7 @@ All numbers are full-precision decimal strings.
 | `seconds` | `pmp`, `sdp`, `dive`; with several nodes also `copy`; `checkpoint` |
 | `precision` | bits of `pmp2sdp` and the solver in this call |
 | `precision_next`, `precision_note`, `call_iterations`, `first_call` | mixed precision only (10.1): the next call's bits, why they changed, this call's iterations, a cold start |
+| `jump`, `jump_cooldown`, `jump_note`, `jump_stop` | large steps only (10.2): m, the calls left at m = 1, why, why the run stopped; `call_iterations` and `first_call` too |
 
 `solves.jsonl` holds no times of day, so two runs with the same layout and block timings compare byte for
 byte.
