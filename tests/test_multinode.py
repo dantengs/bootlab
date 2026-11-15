@@ -1,6 +1,7 @@
 """The multinode parts that run without a cluster (docs/en/interfaces.md section 14): srun's command, a
 node's memory, the checkpoint saved and placed on one node, and `bootlab submit --dry`."""
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"   # tools/make_test_fixture.py
 sys.path.insert(0, str(ROOT / "src"))
 
-from bootlab import cli, execute, inputs  # noqa: E402
+from bootlab import cli, execute, inputs, layout  # noqa: E402
 
 SITE = execute.load_site("lab", FIXTURES)
 L23 = ROOT / "tests" / "fixtures" / "runs" / "seven" / "run-l23.toml"
@@ -24,13 +25,29 @@ L27 = ROOT / "tests" / "fixtures" / "runs" / "seven" / "run-l27.toml"
 
 class Srun(unittest.TestCase):
     def test_one_node_job_unchanged(self):
-        """hosts None (a job of one node): the command as before multinode."""
-        self.assertEqual(execute.srun_argv(SITE, ["p"], 64, 1, 1000, mpi=True)[:5],
+        """hosts None (a job of one node), [mpi] one_node = "srun": a rank a task, as before multinode."""
+        site = dataclasses.replace(SITE, mpi={**SITE.mpi, "one_node": "srun"})
+        self.assertEqual(execute.srun_argv(site, ["p"], 64, 1, 1000, mpi=True)[:5],
                          ["srun", "--exact", "--nodes=1", "--ntasks=64", "--cpus-per-task=1"])
+
+    def test_one_node_mpirun(self):
+        """One node (the default): one task with the ranks' cores, node_mpirun.sh, the image's mpirun."""
+        cmd = execute.srun_argv(SITE, ["p", "--x", 1], 64, 1, 1000, mpi=True)
+        self.assertEqual(cmd[:5], ["srun", "--exact", "--nodes=1", "--ntasks=1", "--cpus-per-task=64"])
+        self.assertNotIn("--mpi=pmix", cmd)
+        i = cmd.index("bash")
+        self.assertEqual(cmd[i:i + 4], ["bash", str(execute.NODE_MPIRUN), "apptainer", "exec"])
+        j = cmd.index(SITE.sif)
+        self.assertEqual(cmd[j + 1:], ["mpirun", "-np", "64", "--map-by", "core", "--bind-to", "core",
+                                       "p", "--x", "1"])
+        n = execute.Node("nodeb-2", "amd2", 256, 376000, ["nodeb-2", "nodeb-4"])
+        self.assertEqual(execute.srun_argv(SITE, ["p"], 64, 1, 1000, mpi=True, hosts=n.solo())[:6],
+                         ["srun", "--exact", "--nodes=1", "-w", "nodeb-2", "--ntasks=1"])
 
     def test_node0_and_all(self):
         n = execute.Node("nodeb-2", "amd2", 256, 376000, ["nodeb-2", "nodeb-4"])
-        self.assertEqual(execute.srun_argv(SITE, ["p"], 64, 1, 1000, mpi=True, hosts=n.solo())[:6],
+        site = dataclasses.replace(SITE, mpi={**SITE.mpi, "one_node": "srun"})
+        self.assertEqual(execute.srun_argv(site, ["p"], 64, 1, 1000, mpi=True, hosts=n.solo())[:6],
                          ["srun", "--exact", "--nodes=1", "-w", "nodeb-2", "--ntasks=64"])
         self.assertEqual(execute.srun_argv(SITE, ["p"], 256, 1, 1000, mpi=True, hosts=n.spread())[:8],
                          ["srun", "--exact", "--nodes=2", "-w", "nodeb-2,nodeb-4", "--ntasks=512",
@@ -90,10 +107,11 @@ class Checkpoint(unittest.TestCase):
         (self.ck / "checkpoint_new.json").write_text(json.dumps({"current": g, "backup": g - 1}))
         os.replace(self.ck / "checkpoint_new.json", self.ck / "checkpoint.json")
 
-    def record(self, n):
+    def record(self, n, keep=1):
+        """keep = 1: the tests written when one generation was kept; KeepCheckpoints below for more."""
         with open(self.run_dir / "solves.jsonl", "a") as f:
             f.write(json.dumps({"step": n, "node": "nodea-1", "procs": 4}) + "\n")
-        execute.prune_kept(self.ck, len(cli.records(self.run_dir)))
+        execute.prune_kept(self.ck, len(cli.records(self.run_dir)), keep)
 
     def test_kept_while_the_solver_saves_on(self):
         """Call 1 ends at generation 2, kept for record 1; call 2 saves 3 and 4 (generation 2's names gone)
@@ -196,6 +214,52 @@ class Checkpoint(unittest.TestCase):
         self.assertTrue(set(others) | {".schur"} <= names)
         self.assertEqual(sorted(n for n in names if execute.RANK_FILE.fullmatch(n)), [f"checkpoint_1_{r}" for r in range(4)])
 
+    def kept(self) -> list:
+        return sorted(int(p.name) for p in (self.ck / "kept").iterdir())
+
+    def test_keep_checkpoints(self):
+        """keep = 2 (the default, inputs.KEEP_CHECKPOINTS) and 3: after record k the newest min(k, keep) kept/,
+        the data held min(k, keep) + 1 generations after a record and never more than keep + 2."""
+        self.assertEqual(inputs.KEEP_CHECKPOINTS, 2)
+        for keep in (inputs.KEEP_CHECKPOINTS, 3):
+            with self.subTest(keep=keep):
+                self.setUp()
+                g = 0
+                for k in range(1, 7):
+                    for _ in range(2):
+                        g += 1
+                        self.save(g)
+                        self.assertLessEqual(self.generations_held(), keep + 2)
+                    execute.keep_generation(self.ck, k, self.LAY)
+                    self.assertLessEqual(self.generations_held(), keep + 2)
+                    self.record(k, keep)
+                    self.assertEqual(self.kept(), list(range(max(1, k - keep + 1), k + 1)))
+                    self.assertEqual(self.generations_held(), min(k, keep) + 1)
+
+    def test_resume_loads_the_newest_of_two(self):
+        """Two kept: a resume loads the newest (kept_for), the older stays as it was; a step killed before its
+        record drops its keep, as with one."""
+        self.save(1)
+        execute.keep_generation(self.ck, 1, self.LAY), self.record(1, 2)
+        self.save(2)
+        execute.keep_generation(self.ck, 2, self.LAY), self.record(2, 2)
+        self.save(3)
+        execute.keep_generation(self.ck, 3, self.LAY)          # killed before record 3
+        self.assertTrue(cli.place_checkpoint(self.r, self.run_dir, 4))
+        self.assertEqual(execute.generation(self.ck), 2)
+        self.assertEqual(self.kept(), [1, 2])
+        self.assertEqual((self.ck / "kept" / "1" / "checkpoint_1_0").read_text(), "1 0")
+
+    def test_keep_checkpoints_checked(self):
+        run = {"skydive": {}}
+        self.assertFalse([e for e in inputs.check_run_numbers(run, []) if "keep_checkpoints" in e])
+        for good in (1, 3):
+            run["skydive"]["keep_checkpoints"] = good
+            self.assertFalse([e for e in inputs.check_run_numbers(run, []) if "keep_checkpoints" in e])
+        for bad in (0, -1, True, "2"):
+            run["skydive"]["keep_checkpoints"] = bad
+            self.assertTrue([e for e in inputs.check_run_numbers(run, []) if "keep_checkpoints" in e], bad)
+
     def test_hard_links_checked(self):
         execute.check_hard_links(self.tmp)                     # a local disk makes them
         self.assertEqual([p.name for p in self.tmp.iterdir()], ["run"])
@@ -250,6 +314,23 @@ class Submit(unittest.TestCase):
         return out.getvalue().splitlines()
 
     HEAD = "sbatch --job-name=bootlab --exclusive --hint=nomultithread --mem=0 --time=48:00:00"
+
+    def test_every_example(self):
+        """Every examples/*/run.toml through submit --dry: a run that had only been started inside a job (a built-in
+        model's, whose card has no name: KeyError in layout.problem_key) shows here first."""
+        tomls = sorted(ROOT.glob("examples/*/run.toml"))
+        self.assertTrue(tomls)
+        for t in tomls:
+            with self.subTest(example=t.parent.name):
+                self.assertTrue(any(l.startswith(self.HEAD) for l in self.submit(t, None)))
+
+    def test_builtin_key(self):
+        """A built-in model's bench key is its card's bound and Lambda, as current's bench rows name it."""
+        p = inputs.load(ROOT / "examples" / "jjjj" / "run.toml")
+        self.assertEqual(p.model_name, "JJJJ3d")
+        self.assertEqual(layout.problem_key(p), ("JJJJ3d", p.numerics["lambda"]))
+        q = inputs.load(ROOT / "examples" / "ising" / "run.toml")
+        self.assertEqual(q.model_name, q.model["name"])
 
     def test_no_resources_one_node(self):
         """No [resources]: one node, where Slurm puts it; the job sources the site's setup.sh and starts the

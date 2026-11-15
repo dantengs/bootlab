@@ -164,5 +164,31 @@ class RunsNetwork(unittest.TestCase):
         self.assertEqual(out[:3], ["nfs4", "nfs-ib", "tcp"])
 
 
+class SitesWithoutTreePaths(unittest.TestCase):
+    """The repository's sites give no runs or python: those are the installation's (bootlab.toml, else
+    <install root>/runs and <install root>/python), so a site never points one installation at another's tree
+    (a test tree's regression once ran into the deployed tree's runs)."""
+
+    def test_no_runs_or_python(self):
+        import tomllib
+        files = sorted((ROOT / "sites").glob("*/site*.toml"))
+        self.assertTrue(files or not (ROOT / "sites").exists())     # a tree without sites/ has nothing to check
+        for f in files:
+            with open(f, "rb") as fh:
+                d = tomllib.load(fh)
+            self.assertFalse({"runs", "python"} & set(d), f"{f.relative_to(ROOT)} gives runs or python")
+
+    def test_from_the_installation(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BOOTLAB_RUNS", None)
+            root = Path(d)
+            s = execute.site_paths({"sif": "/images/x.sif"}, root)
+            self.assertEqual(s["runs"], str(root / "runs"))
+            (root / "python" / "bin").mkdir(parents=True)
+            (root / "python" / "bin" / "python3").touch()
+            self.assertEqual(execute.site_paths({"sif": "/images/x.sif"}, root)["python"],
+                             str(root / "python" / "bin" / "python3"))
+
+
 if __name__ == "__main__":
     unittest.main()

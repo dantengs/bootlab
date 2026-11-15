@@ -49,7 +49,7 @@ Skydive 每一步算当前点 `x` 及其 `k` 个邻点 `x + ε eᵢ`，求解一
 - Linux x86-64 集群，**Slurm ≥ 21.08**（要用 `srun --exact`、`--overlap`），`srun` 的 MPI 插件能与镜像里的 Open MPI 4.1
   配合（默认 pmix）。
 - 登录节点和计算节点上有 **Apptainer ≥ 1.1**。
-- **bootlab 执行层镜像**（`bootlab-exec`，r5 或更新的版本）。镜像暂不随本仓库发布，见[已知限制](#已知限制)。
+- **bootlab 执行层镜像**（`bootlab-exec`，r5 或更新的版本；当前是 r8，见[获取镜像](#获取镜像)）。
 - 一个作业的各节点都能看到的共享文件系统，放运行目录；必须支持硬链接。
 - 建议有节点本地 scratch 盘（探测会实测它是否比共享盘快）。
 - 可选：Slurm 配好的 cgroup v2（`pmp2sdp` 的内存看门狗要用；没有就关掉看门狗，并在 `driver.log` 里写明）。
@@ -59,18 +59,29 @@ Skydive 每一步算当前点 `x` 及其 `k` 个邻点 `x + ε eᵢ`，求解一
 
 主机上不需要 Python。
 
+## 获取镜像
+
+执行层镜像放在 GitHub Container Registry 上（378 MB）：
+
+```bash
+apptainer pull bootlab-exec-2026.11-r8.sif oras://ghcr.io/dantengs/bootlab-exec:2026.11-r8
+sha256sum bootlab-exec-2026.11-r8.sif       # cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
+```
+
+`install.sh` 会再核对一次 sha256。镜像里各程序的许可证在镜像内的 `/opt/bootlab/licenses`。
+
 ## 快速开始
 
 ```bash
 git clone <本仓库> bootlab && cd bootlab
 module load apptainer                     # 或者用你的集群自己的办法让 apptainer 进 PATH
-./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <镜像的 sha256>
+./install.sh --image /path/to/bootlab-exec-2026.11-r8.sif --sha256 cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
 
 # 探测拿不到的（你的 Slurm 分区、时限）；可以是空文件：这时用集群的默认分区和 48 小时时限
 touch mysite.hand.toml
 
 # 探测集群（每种节点型号一个小作业：8 核、16 GB、15 分钟），合并，生成站点
-bin/bootlab probe plan --sif /path/to/bootlab-exec-r5.sif --out probe --submit
+bin/bootlab probe plan --sif /path/to/bootlab-exec-2026.11-r8.sif --out probe --submit
 bin/bootlab probe merge probe              # 等探测作业都结束后
 bin/bootlab site gen --probe probe/probe.json --hand mysite.hand.toml --out sites/mysite
 echo 'site = "mysite"' >> bootlab.toml
@@ -97,8 +108,8 @@ bootlab 也能在一台没有 Slurm 的 Linux 机器上跑：
 - 与集群上一样，主机上不需要 Python。
 
 ```bash
-./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <镜像的 sha256>
-bin/bootlab probe local --sif /path/to/bootlab-exec-r5.sif --out probe   # 在本机跑几分钟：核、内存、磁盘、全核 mpirun
+./install.sh --image /path/to/bootlab-exec-2026.11-r8.sif --sha256 cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
+bin/bootlab probe local --sif /path/to/bootlab-exec-2026.11-r8.sif --out probe   # 在本机跑几分钟：核、内存、磁盘、全核 mpirun
 touch ws.hand.toml
 bin/bootlab site gen --probe probe/probe.json --hand ws.hand.toml --out sites/ws
 echo 'site = "ws"' >> bootlab.toml
@@ -126,6 +137,7 @@ bootlab 怎样选择：
 | 开发者接口：每一层、每种文件格式、每个配置项 | [docs/en/interfaces.md](docs/en/interfaces.md) | [docs/zh/interfaces.md](docs/zh/interfaces.md) |
 | 与 simpleboot、Hyperion 的比较 | [docs/en/comparison.md](docs/en/comparison.md) | [docs/zh/comparison.md](docs/zh/comparison.md) |
 | 用 AI 助手写新模型 | [docs/en/writing-models-with-ai.md](docs/en/writing-models-with-ai.md) | [docs/zh/writing-models-with-ai.md](docs/zh/writing-models-with-ai.md) |
+| 设计稿（尚未实现）：可行性判定、二分、Delaunay 搜索与 navigator | [docs/en/design-search-algorithms.md](docs/en/design-search-algorithms.md) | [docs/zh/design-search-algorithms.md](docs/zh/design-search-algorithms.md) |
 
 ## 路线图
 
@@ -140,7 +152,6 @@ bootlab 怎样选择：
 
 ## 已知限制
 
-- 执行层镜像还没公开。没有镜像时，bootlab 只能跑单元测试。
 - 只支持 d = 3、外部算符全是标量（生成器的 `bt-model/2` 格式和 scalar_blocks 的限制）。
 - 把 simpleboot 的 AutoEqu/VBlock 文件转成 `bt-model/2` 的转换器在作者的工具链里，不在这次发布里；模型要手写或者借助 AI
   助手来写（[指南](docs/zh/writing-models-with-ai.md)）。

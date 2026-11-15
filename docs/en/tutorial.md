@@ -14,7 +14,7 @@ Commands run on the cluster's **login node** unless the text says otherwise. Pat
 - Slurm ≥ 21.08 and Apptainer ≥ 1.1 (see the README's [requirements](../../README.md#requirements)).
 - The bootlab execution image, `bootlab-exec-<version>-r5.sif` or later, and its sha256. The image holds every
   program bootlab runs (the PMP generator, `scalar_blocks`, `pmp2sdp`, `dynamical_sdp`, Open MPI, UCX) and the
-  driver's Python 3.12. It is not yet distributed with the repository.
+  driver's Python 3.12. How to get it: [Getting the image](../../README.md#getting-the-image).
 - A directory on a file system that all compute nodes see (for the installation and the runs).
 
 ## 1. Install
@@ -37,11 +37,17 @@ image /shared/images/bootlab-exec-r5.sif: sha256 checked
 python: 2259 files from the image checked; 3.12.15
 wrote /shared/<you>/bootlab/bootlab.toml
 wrote /shared/<you>/bootlab/bin/bootlab
-......................................................................
 ----------------------------------------------------------------------
-Ran 159 tests in 6.0s
+Ran 18 tests in 0.2s
 
 OK
+installation checked: modules import, bin/bootlab starts, quick tests pass
+......................................................................
+----------------------------------------------------------------------
+Ran 216 tests in 15.0s
+
+OK
+selftest: every unit test passed
 ```
 
 1. checks the image's sha256 (when `--sha256` is given);
@@ -51,11 +57,15 @@ OK
    environment;
 3. writes `bootlab.toml` (installation settings; see `bootlab.example.toml`) unless it exists;
 4. writes `bin/bootlab`, the command you use from now on, unless it exists;
-5. runs the unit tests with that Python.
+5. checks the installation quickly: every module imports, `bin/bootlab` starts, and two quick unit tests
+   (`tests/test_install.py`, `tests/test_regress.py`) pass; a failure here stops it;
+6. runs `bin/bootlab selftest`, every unit test. A failure there is only a warning (`install.sh: warning:
+   bin/bootlab selftest failed`): the installation is in place, and most of those tests are not about it.
 
 Apptainer may print `INFO:` lines of its own; they do not matter. If `apptainer` is not on `PATH`,
 `install.sh` stops and says so. An existing `python/` stops it too: it never overwrites (move the old one away
-to install anew). The number of tests grows with the code; what matters is the final `OK`.
+to install anew). The number of tests grows with the code; what matters is `installation checked`, and for the
+full tests the last `OK`. Run them again any time with `bin/bootlab selftest`.
 
 From here on use `bin/bootlab <command>`; it works from any directory, also through a symbolic link.
 
@@ -210,10 +220,10 @@ bin/bootlab regress                    # or: bin/bootlab regress --node node03 -
 ```
 
 It writes the regression inputs (the Ising example at Λ = 11, three steps) to
-`runs/regress-input-<time>/` and submits one whole-node job. It prints the inputs and the `sbatch` command:
+`runs/regress-input-<time>-<pid>/` and submits one whole-node job. It prints the inputs and the `sbatch` command:
 
 ```
-# inputs /shared/<you>/bootlab/runs/regress-input-20261113-202539
+# inputs /shared/<you>/bootlab/runs/regress-input-20261113-202539-41872
 # the nodes named in run.toml: node03
 sbatch --job-name=bootlab --exclusive --hint=nomultithread --mem=0 --time=01:00:00 ... --wrap ...
 Submitted batch job 81250

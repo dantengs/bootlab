@@ -163,6 +163,22 @@ class Decisions(unittest.TestCase):
                          ("tcp,self,sm", "tcp-1g", "shared"))
         self.assertFalse(site["multinode"]["allowed"])
 
+    def test_nested_tables_and_the_hand_generators(self):
+        """write_toml writes tables at any depth and reads back as it was; the hand file's [generators.*] (with
+        its .env) goes into the generated site as it is."""
+        import tomllib
+        hand = {"generators": {"current": {"program": "/g/exec", "pmp2sdp": "pmp2sdp_3.1.0", "sdpb": "sdpb_3.1.0",
+                                           "env": {"CUR_ROOT": "/c", "HYP_SITE_DIR": "{root}/gen/current/site"}}}}
+        recs = [node("a-1", [0.1] * 3, [5.0] * 3), node("a-2", [0.1] * 3, [5.0] * 3)]
+        site, notes, _ = sitegen.generate(self.probe(recs), hand, set())
+        self.assertEqual(site["generators"], hand["generators"])
+        text = sitegen.write_toml(site, notes)
+        self.assertIn("\n[generators.current]\n", text)
+        self.assertIn("\n[generators.current.env]\n", text)
+        self.assertEqual(tomllib.loads(text), json.loads(json.dumps(site)))
+        d = {"a": 1, "t": {"x": 2, "u": {"y": 3, "v": {"z": [4]}}}, "only": {"sub": {"k": "s"}}}
+        self.assertEqual(tomllib.loads(sitegen.write_toml(d, {})), d)
+
     def test_paths_from_the_installation_and_the_route(self):
         recs = [node("a-1", [0.1] * 3, [5.0] * 3), node("a-2", [0.1] * 3, [5.0] * 3)]
         for r in recs:

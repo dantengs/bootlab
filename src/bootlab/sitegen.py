@@ -148,19 +148,26 @@ def toml_value(v) -> str:
 
 
 def write_toml(d: dict, notes: dict) -> str:
+    """d as TOML: its values, then each table as [a], [a.b], [a.b.c] … at any depth (a header where the table has
+    values of its own, or none at all); notes are comments on the top-level keys and tables."""
     out = []
-    flat = {k: v for k, v in d.items() if not isinstance(v, dict)}
-    for k, v in flat.items():
-        out.append(f"{k} = {toml_value(v)}" + (f"   # {notes[k]}" if k in notes else ""))
+    for k, v in d.items():
+        if not isinstance(v, dict):
+            out.append(f"{k} = {toml_value(v)}" + (f"   # {notes[k]}" if k in notes else ""))
+
+    def table(path: list, t: dict):
+        values = [(k, v) for k, v in t.items() if not isinstance(v, dict)]
+        if values or not t:          # an empty table is written too, so it reads back
+            note = notes.get(path[0]) if len(path) == 1 else None
+            out.append(f"\n[{'.'.join(path)}]" + (f"   # {note}" if note else ""))
+            out.extend(f"{k} = {toml_value(v)}" for k, v in values)
+        for k, v in t.items():
+            if isinstance(v, dict):
+                table(path + [k], v)
+
     for k, v in d.items():
         if isinstance(v, dict):
-            subs = {kk: vv for kk, vv in v.items() if isinstance(vv, dict)}
-            if len(subs) < len(v):
-                out.append(f"\n[{k}]" + (f"   # {notes[k]}" if k in notes else ""))
-                out += [f"{kk} = {toml_value(vv)}" for kk, vv in v.items() if not isinstance(vv, dict)]
-            for kk, vv in subs.items():
-                out.append(f"\n[{k}.{kk}]")
-                out += [f"{a} = {toml_value(b)}" for a, b in vv.items()]
+            table([k], v)
     return "\n".join(out) + "\n"
 
 
@@ -230,6 +237,8 @@ def generate(probe: dict, hand: dict, mask: set) -> tuple:
         site["shared_measured_at"] = measured
     if "bench" in hand:          # measurements are not the probe's: a hand-named bench directory
         site["bench"] = hand["bench"]
+    if "generators" in hand:     # built-in models' generators (interfaces 19): the hand file's, as they are
+        site["generators"] = hand["generators"]
     if allowed or refused:
         use = allowed or {t: h for t, (h, _) in refused.items()}
         mn = {"prefer": sorted(use, key=lambda t: -types[t]["physical_cores"]),
@@ -247,10 +256,14 @@ def generate(probe: dict, hand: dict, mask: set) -> tuple:
     notes = {"scratch": "the fastest measured (scratch_basis)", "binds": "the shared directory's mount point and the local scratch's base",
              "env_unset": "rank_env.sh sets UCX_NET_DEVICES per node",
              "mpi": "rank_env.sh picks each node's IB port at every start; ib_exclude from the hand file",
-             "sif": "hand", "python": "hand", "runs": "hand", "slurm": "hand",
+             "sif": "hand", "python": "hand", "runs": "hand",
              "shared_measured_at": "the start warns when the runs directory is not in one of them",
              "shared_network": "the runs file system's server and network on every probed node; the start warns when "
                                "a node's differs"}
+    from_plan = partition and "partition" not in hand.get("slurm", {})
+    if from_plan or hand.get("slurm"):     # where [slurm] comes from: the probe plan's partition, the hand file
+        notes["slurm"] = ("partition from the probe plan" if from_plan else "hand") + (
+            ", the rest hand" if from_plan and hand.get("slurm") else "")
     if "multinode" not in site:
         report.append("no pair probe: one node only")
     if seen:
@@ -290,6 +303,8 @@ def generate_local(probe: dict, hand: dict) -> tuple:
         site["mem_gb"] = hand["mem_gb"]
     if "bench" in hand:
         site["bench"] = hand["bench"]
+    if "generators" in hand:
+        site["generators"] = hand["generators"]
     notes = {"launcher": "probe local: no Slurm on this machine", "scratch": "the fastest measured (scratch_basis)",
              "memory_guard": "the pmp2sdp memory watchdog: rss or a systemd user scope",
              "shared_measured_at": "the start warns when the runs directory is not in one of them"}

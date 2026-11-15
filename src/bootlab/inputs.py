@@ -1,4 +1,5 @@
-"""The physics layer: the model (bt-model/2 JSON), the spectrum and the objective (TOML), and run.toml.
+"""The physics layer: the model (bt-model/2 JSON, or a built-in model's card: builtin.py), the spectrum and the
+objective (TOML), and run.toml.
 
 Everything is checked once, here. A spectrum value may refer to point parameters; resolve_spectrum works
 it out exactly at a point and gives bt's spectrum section (docs/en/interfaces.md section 3).
@@ -172,6 +173,9 @@ SKYDIVE_NUMBERS = ["gap_upper_limit", "infinitesimal", "gap_upper_limit_track", 
 TRACK_MAX = 3
 TRACK_C = "1"                      # [skydive].gap_upper_limit_track when left out
 TRACK_OFF = "off"
+# [skydive] keep_checkpoints: the kept generations a run leaves after each record (execute.prune_kept);
+# the latest 2 by default, for Skydive and the navigator.
+KEEP_CHECKPOINTS = 2
 
 
 def track_c(o: dict):
@@ -253,6 +257,23 @@ def check_run_numbers(run, coords) -> list:
         errors.append(f"run.toml [skydive] large_steps = {o['large_steps']!r} is not true or false: true takes the "
                       "next point up to 8 solver steps ahead on straight stretches of the path (jump.py); false (the "
                       "default) takes the solver's step")
+    for key, least, what in (("precision_return_after", 1, "healthy calls at full precision in a row before a mixed "
+                                                           "precision run goes back down"),
+                             ("precision_return_limit", 0, "times a mixed precision run may go back down"),
+                             ("precision_return_margin", 0, "digits above 30 a return asks for")):
+        v = o.get(key, least)
+        if isinstance(v, bool) or not isinstance(v, int) or v < least:
+            errors.append(f"run.toml [skydive] {key} = {v!r} is not a whole number of at least {least}: the {what} "
+                          "(precision.decide; left out: precision.RETURN_AFTER, RETURN_LIMIT, RETURN_MARGIN)")
+    keep = o.get("keep_checkpoints", KEEP_CHECKPOINTS)
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+        errors.append(f"run.toml [skydive] keep_checkpoints = {keep!r} is not a whole number of at least 1: the solver "
+                      f"checkpoints kept after each record, the newest first ({KEEP_CHECKPOINTS} when left out); a "
+                      "resume loads the newest")
+    k = o.get("large_steps_sign_cooldown")
+    if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 1):
+        errors.append(f"run.toml [skydive] large_steps_sign_cooldown = {k!r} is not a whole number from 1: the calls "
+                      "at one step after N changed sign following a large step; left out, no more large steps (jump.py)")
     eps = o.get("infinitesimal")
     if isinstance(eps, (int, str)) and _exact(eps) and frac(eps) < frac(INFINITESIMAL_MIN):
         errors.append(f"run.toml [skydive] infinitesimal {eps} is below {INFINITESIMAL_MIN}: the generator keys and "
@@ -297,8 +318,24 @@ class Problem:
     def numerics(self) -> dict:
         return self.run["numerics"]
 
+    @property
+    def model_name(self) -> str:
+        """The model as bench rows and logs name it: bt-model/2's name, a built-in model's card its bound (JJJJ3d;
+        the card has no name)."""
+        return self.model["bound"] if self.model.get("format") == "bootlab-builtin/1" else self.model["name"]
+
+    @property
+    def builtin(self) -> bool:
+        """A built-in model's problem (builtin.py): its PMP from the card's generator, its solver options the bound's."""
+        return self.model.get("format") == "bootlab-builtin/1"
+
     def solver_precision(self) -> int:
+        """The solver's (and pmp2sdp's) precision. A built-in model's is its bound's: upstream's SimpleBoundParams
+        bounds (JJJJ2025.jjjj3dBound) set SDPB's precision to block_precision; a Skydive step checks it against
+        the generator's sdpb.args.json."""
         n = self.numerics
+        if self.builtin:
+            return n["block_precision"]
         if "solver_precision" in n:
             return n["solver_precision"]
         if n.get("block_preset", "simpleboot") == "simpleboot":
@@ -326,8 +363,14 @@ def load(run_toml) -> Problem:
         spectrum = tomllib.load(f)
     with open(base / inputs["objective"], "rb") as f:
         objective = tomllib.load(f)
+    if model.get("format") == "bootlab-builtin/1":
+        from . import builtin   # here: builtin imports this module
+        return builtin.load(run_toml, run, model, spectrum, objective)
 
     errors, warnings = [], []
+    if "scan" in run:
+        errors.append("run.toml [scan] is for built-in models (bootlab-builtin/1, interfaces section 19); "
+                      "a bt-model/2 model runs a Skydive")
     if model.get("format") != "bt-model/2":
         errors.append(f"model: format is {model.get('format')!r}, not bt-model/2")
     if spectrum.get("format") != "bootlab-spectrum/1":

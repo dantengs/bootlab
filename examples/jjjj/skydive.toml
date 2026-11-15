@@ -1,0 +1,40 @@
+# <JJJJ> Skydive along x = 12 gamma, with upstream's jjjj_test_nmax6 settings (JJJJ2025.paramsNmax6) and the
+# same model, spectrum and objective as run.toml's scan. The solver minimizes the SDP's objective N over x: with
+# the upper bound along lambda = (1, x), N is about the dual objective, -B(x), so the run ends at the x where the
+# upper bound B(x) on the external T term is largest (DPTV's C_T lower bound at its weakest; upstream's run at three
+# points puts it near x = 0, B = 4.484). The solver's options are the bound's own (the generator's sdpb.args.json, upstream's):
+# precision 768, dualityGapThreshold 1e-30.
+format = "bootlab-run/1"
+name   = "jjjj-nmax6-skydive"
+
+[inputs]
+model     = "model.json"
+spectrum  = "spectrum.toml"
+objective = "objective.toml"
+
+[numerics]
+lambda          = 11
+order           = 60
+num_poles       = 20
+max_spin        = 40
+block_precision = 768
+
+[coords]
+names = ["x"]
+
+[skydive]
+start           = ["0.5"]
+box_min         = ["-2"]
+box_max         = ["2"]
+max_steps       = 60
+# upstream's defaultSkydiveConfig: dualityGapUpperLimit 0.1. With N about -4.5 the tracked limit
+# min(0.1, max(|N_prev|, 0.1 |N_1|, 1e-27)) stays 0.1, and the threshold 1e-30 stays 1e-30: upstream's options at
+# every step.
+gap_upper_limit = "0.1"
+# Far from the maximum, where N is concave, BFGS does not update and each step is 0.5-0.8% of a Newton step: from
+# x = 0.5 the plain run got to 0.22 in 60 steps, with large steps to the maximum in 30. On
+# for a start far away; off is bootlab's default.
+large_steps     = true
+
+# sdpb's options by flag name, over the bound's own; maxRuntime is the job's time left less 15 minutes.
+[solver]

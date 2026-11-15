@@ -55,7 +55,7 @@ Every external program is started as an `srun` step inside the job's allocation 
 | # | Data | Producer | Where | Deleted |
 |---|---|---|---|---|
 | 1 | generator input `request.json` | `pmp.write_request` | `<scratch>/<run id>/step_<n>/request.json` | with the step |
-| 2 | block tables (rational approximations of the blocks, one file per spin) | scalar_blocks, called inside the generator | `<scratch>/<run id>/blocks/`, shared across the run's steps | at the end of the run |
+| 2 | block tables (rational approximations of the blocks, one file per spin) | scalar_blocks, called inside the generator | `<scratch>/<run id>/blocks/p<bits>/` (one directory a precision), shared across the run's steps | after each generator call (Skydive, `skydive.Run.prune_blocks`): those neither of the last two calls made, unless Δ12 = Δ34 = 0 (the same at every point); driver.log gives the size kept and removed; the rest at the end of the run |
 | 3 | PMP: JSON parts shared by the step's points, one list per point | the generator | `step_<n>/pmp/json/`, `step_<n>/pmp/<point>/pmp.nsv` | after the step; the end point's is copied to `endpoint/` |
 | 4 | SDP (`block_info_*.json`, `block_data_*.bin`) | `pmp2sdp` | `step_<n>/sdp/<point>/` | after the step |
 | 5 | solver output and checkpoint | `dynamical_sdp` | `step_<n>/out/`; the checkpoint in `<run>/checkpoint/` | out's small files go to `<run>/steps/<n>/`; the checkpoint is kept (section 11) |
@@ -211,7 +211,12 @@ gap_upper_limit = "1e-12"                  # required
 # infinitesimal = "1e-20"                  # >= 1e-25
 # block_timings = "/abs/path/checkpoint/block_timings"   # a new run: another run's block costs, no timing run
 # mixed_precision = false                  # true: section 10.1
+# precision_return_after = 3               # 10.1: healthy calls at full before going back down (untested)
+# precision_return_limit = 2               # 10.1: times a run may go back down (untested)
+# precision_return_margin = 10             # 10.1: digits above 30 a return asks for (untested)
 # large_steps = false                      # true: section 10.2
+# keep_checkpoints = 2                     # kept generations left after each record (section 11)
+# large_steps_sign_cooldown = 3            # left out: no more large steps after N changes sign (10.2)
 
 [solver]                                   # SDPB options by flag name, over skydive.solver_defaults(nmax)
 [dynamical]                                # dynamical_sdp's own options, over skydive.DYNAMICAL_DEFAULTS
@@ -241,7 +246,7 @@ dynamical_sdp's defaults); `tests/test_skydive.py` pins them. `--maxRuntime` is 
 | `skydive.py` | the Skydive loop, records, endings; solver defaults | `Run.loop`, `Run.step`, `gap_threshold`, `tracked_gap_limit`, `optimal_ending`, `solver_defaults`, `start_state`, `resume_state` |
 | `execute.py` | sites and installation; `srun` steps; `pmp2sdp` waves with the memory watchdog; `dynamical_sdp`; reading its output; scratch choice; copies between nodes; checkpoint generations | `load_site`, `srun_argv`, `build_sdps`, `run_dynamical_sdp`, `read_dive`, `classify`, `choose_scratch`, `distribute`, `keep_generation`, `restore_generation` |
 | `layout.py` | nodes for a run from the site and bench; the allocation check | `choose_nodes`, `resume_plan`, `check_allocation`, `permitted` |
-| `bench.py` | the bench files; solver processes; `pmp2sdp` processes and instances | `load_bench`, `solver_procs`, `grid_ok`, `pmp2sdp_procs`, `pmp2sdp_at_once` |
+| `bench.py` | the bench files; solver processes; `pmp2sdp` processes and instances | `load_bench`, `solver_procs`, `grid_ok`, `pmp2sdp_procs`, `pmp2sdp_at_once`, `sdp_build_row` |
 | `cli.py` | `run`, `resume`, `submit`, `summary`, `regress`, `probe`, `site` | `main` |
 | `probe.py` | the cluster probe | `plan`, `node`, `pair`, `merge` subcommands |
 | `sitegen.py` | a site from the probe; site diff | `generate`, `choose_scratch`, `multinode` |
@@ -297,6 +302,13 @@ parts are copied to `<run>/endpoint/pmp/parts/` with `pmp.nsv`, `precision` and 
 
 ## 8. Execution layer: one dive
 
+Before it, the step's PMPs from one generator call, under a watchdog: when the call's logs, its output
+directory and its block directory all stay unchanged for longer than 5 times the run's first generator call
+(at least 10 minutes; 1 hour before a call has been timed), the call is ended and the run ends as
+`unfinished: generator stalled after N s without output …`, with the limit's basis and the last lines of
+`generator.err` (a generator has been seen to hang silently in its parts stage); the checkpoint is intact and a resume
+starts the step again, as after maxRuntime. driver.log gives the limit.
+
 1. `k+1` `pmp2sdp` instances (`pmp2sdp --precision <p> --input <pmp.nsv> --output <sdp dir>`), in waves
    (section 9).
 2. One `dynamical_sdp` on all physical cores of the node(s) (or the bench's choice), with `--sdpDir` the
@@ -335,7 +347,7 @@ Each of the three stages (generator → `pmp2sdp` → solver) has the whole node
 | Stage | Parallelism | How bootlab chooses |
 |---|---|---|
 | `dynamical_sdp` | MPI, once per step | from the bench rows of this node type on one node: the problem nearest in size (distance \|ln(N/Nᵢ)\| + \|ln(blocks/blocksᵢ)\|), its fastest process count, among counts with a non-degenerate grid; no rows: all physical cores. Fixed for the run (the warm-start chain needs it) |
-| `pmp2sdp` | MPI, scales poorly | p = min(31, ⌊cores ÷ points⌋) processes per instance. The first step converts the centre alone and reads the srun step's cgroup (memory.current − file + shmem, every 0.2 s) for the peak P; then k = ⌊(node memory − driver_reserve) ÷ (1.15 P)⌋ instances at once. Each step's `--mem` = node memory ÷ instances. A **watchdog** cancels a wave whose step holds more than 95 % of its `--mem` (pmp2sdp does not fail but stalls when memory is short); the step fails. Without cgroup v2 the watchdog is off and the node's MemTotal − MemAvailable is used |
+| `pmp2sdp` | MPI, scales poorly | p = min(31, ⌊cores ÷ points⌋) processes per instance. The first step (unless a bench `sdp_build` row of `bootlab bench` gives P) converts the centre alone and reads the srun step's cgroup (memory.current − file + shmem, every 0.2 s) for the peak P; then k = ⌊(node memory − driver_reserve) ÷ (1.15 P)⌋ instances at once. Each step's `--mem` = node memory ÷ instances. A **watchdog** cancels a wave whose step holds more than 95 % of its `--mem` (pmp2sdp does not fail but stalls when memory is short); the step fails. Without cgroup v2 the watchdog is off and the node's MemTotal − MemAvailable is used |
 | block tables | scalar_blocks threads, inside the generator | k = min(tables, cores ÷ 4) tables at once, cores ÷ k threads each |
 
 **Non-degenerate grid**: Elemental's default process grid takes rows = the first divisor of p from ⌊√p⌋ up;
@@ -348,13 +360,21 @@ p = 127 gives 127 × 1 (slow), 128 gives 16 × 8. Powers of two always qualify.
 | List | Row fields (main) | Read by |
 |---|---|---|
 | `solver` | `problem`, `model`, `lambda`, `N`, `blocks`, `precision`, `program`, `nodes`, `procs_per_node`, `s_per_iter`, `max_memused_gb`, `transport` (several nodes; default `ib`), `source` | `bench.solver_procs`, `layout.choose_nodes` |
-| `sdp_build`, `blocks`, `generator`, `copy`, `rdma`, `pmp_size`, `nfs` | measurements of each stage | for people; the code reads only `solver` |
+| `sdp_build` | `problem`, `model`, `lambda`, `N`, `blocks`, `precision`, `program`, `instances`, `procs`, `sdps`, `wall`, `per_sdp`, `peak_gb_per_instance`, `held_mb` (rows of `bootlab bench`), `cgroup_peak_mb`, `source` | `bench.sdp_build_row` (rows with `held_mb`): the Skydive loop's `pmp2sdp` memory (10) |
+| `generator` | `problem`, `model`, `lambda`, `precision`, `points`, `cores`, `program`, `wall`, `node_gb`, `source` (rows of `bootlab bench`; older rows: a whole step) | for people |
+| `blocks`, `copy`, `rdma`, `pmp_size`, `nfs` | measurements of each stage | for people |
 
-A missing bench file means: all physical cores, one node, `pmp2sdp` measured at step 1.
+A missing bench file means: all physical cores, one node, `pmp2sdp` measured at step 1. A step that finds an
+`sdp_build` row of `bootlab bench` for its model, Λ, precision and `pmp2sdp` processes on its node type takes
+k from that row's `held_mb` and does not measure the central SDP alone first.
 
 **`bootlab bench <run.toml> [--node H] [--time] [--dry]`** (`benchrun.py`): one job of one whole node, via
-`submit` (`bench run <run.toml>` in the job; in local mode in the background). The generator writes the PMP
-of the run's start point alone, one `pmp2sdp` makes its SDP, and `sdpb_3.0sky` runs `--maxIterations 12` on
+`submit` (`bench run <run.toml>` in the job; in local mode in the background). At each precision a run calls
+at first (the problem's; with `mixed_precision` also the ladder's choice at `gap_upper_limit`, 10.1) the generator
+writes the PMP of the run's start point alone on all physical cores (a `generator` row: its wall time, `node_gb`
+the rise of the node's MemTotal − MemAvailable) and one `pmp2sdp` with the processes a run gives an instance
+(`pmp2sdp_procs` for the run's points) makes its SDP (an `sdp_build` row: wall time, the held memory as a step
+measures it). Then `sdpb_3.0sky` runs `--maxIterations 12` at full precision on
 all physical cores and on half of them (`grid_ok` counts only). Seconds per iteration = (t₁₂ − t₄) / 8 from the
 iteration table (whole seconds). Each count gives one `solver` row (`model`, `lambda`, `N`, `blocks`,
 `precision`, `program`, `nodes` = 1, `procs_per_node`, `s_per_iter`, `source` = the date and the machine's
@@ -396,7 +416,7 @@ directions the end points of two runs can differ by far more than N does.
 Off by default; `bin/bootlab regress` runs at full precision. The solver and `pmp2sdp` run at the lowest
 precision P of {384, 512, 768, 1024} below the problem's `solver_precision` with
 `0.30103·P − 95 − 0.6·log10(1/gap) ≥ 30` digits (the gap of the last record, `gap_upper_limit` at the start),
-else at full precision. Never lowered. Basis (measured): 78 and 83 digits lost with `infinitesimal` 1e-40 at
+else at full precision; up to full and back down under the rules below. Basis (measured): 78 and 83 digits lost with `infinitesimal` 1e-40 at
 Λ = 23 and 27, whole steps 2.3–2.6 times faster at 384–512 bits there; 68 digits lost with 1e-20 at Ising Λ = 11
 (384 bits agreed with 785 bits and with the reference program to 47.5 digits); at gap 6.8e-21 the steps at 384
 and 512 bits agreed with 785 bits to 40.9 and 80.2 digits (62 lost by the formula); on a larger problem (N ≈ 2300,
@@ -412,22 +432,46 @@ gain is lost in the differences between two nodes. In bootlab, on a larger probl
 generator and `pmp2sdp` took about 220 s a step at either precision. So a whole step in bootlab gains less than the
 2.3–2.6 above, which were measured with the generation at the lower precision too.
 
-- **Health check** below full precision (full from the next call on): the call aborted; `findMinimumQ` is
-  true after a stepped call where it was false (the path left the allowed region; from true to false, entering it,
-  is the usual path of a run started outside); a call that neither climbed, started cold nor started a large step ahead
-  (10.2) made more than max(4, 2 × the median of the last 5 such calls) iterations. N's sign is not checked.
+- **Health check**: the call aborted; `findMinimumQ` is true after a stepped call where it was false (the path
+  left the allowed region; from true to false, entering it, is the usual path of a run started outside);
+  a call that neither climbed, started cold nor started a large step ahead (10.2) made more than max(4, 2 × the
+  median of the last 5 such calls) iterations. N's sign is not checked.
+- **States** (`precision.decide`; each record's `precision_state` is the state of the next call, its
+  `precision_next` that call's precision, `precision_note` why when either changes; `summary.md` lists the changes
+  under "Precision"). Everything follows from the records, so a resume needs nothing else; a record from before
+  these states counts as low when its `precision_next` is below full, else high.
+  - **low**: a call that fails the health check goes to **confirm**, or to **locked** when it comes within 5 calls
+    of going back down. When no rung below full keeps 30 digits at the gap: **locked**.
+  - **confirm**: the same call again at full precision, at the same point with the same BFGS state, from the
+    generation kept for the record before it (none: from scratch, as the call was); the call below full keeps its
+    record and its logs go to `steps/<n>-<P>bits/`; an aborted call below full is confirmed the same way. If the call
+    at full fails the check too, the behaviour is the path's, not the precision's: back to **low** at the ladder's
+    choice, from the call at full's step and generation (an aborted call ends the run, as at any precision). If it
+    passes: **high**.
+  - **high**: full precision. **Locked** when the run has gone back down `precision_return_limit` times (2) or no
+    rung below full keeps 30 + `precision_return_margin` (10) digits at the gap; **low** at the lowest rung that
+    keeps them after `precision_return_after` (3) calls at full in a row that pass the check (the confirming call
+    counts; climbing calls neither count nor break the run). The three defaults are starting values, not measured.
+  - **locked**: full precision to the end.
 - **End**: an `optimal` call below full precision decides nothing; the same point with the same BFGS state is
-  solved again at full precision (its logs go to `steps/<n>-<P>bits/`), and that call decides. The endpoint and
-  the EFM are at full precision.
+  solved again at full precision (its logs go to `steps/<n>-<P>bits/`), and that call decides (**locked**). The
+  endpoint and the EFM are at full precision.
 - **Checkpoint**: the binary checkpoint stores each number in a size set by the precision and does not store
   the precision, and `dynamical_sdp` cannot read one of another precision (its text checkpoint would mean writing
-  X and Y as text at every call below full precision). A call's precision is at least that of the generation it
-  starts from (`layout.json` `precision`; none: the problem's); before a call at a higher one the driver rewrites
-  that generation at it as the next generation, the limbs padded with zeros (`precision.convert_checkpoint`). So
-  mixed precision turned on for a run whose checkpoint is at full precision stays at full. A resume continues at
-  the last record's `precision_next`.
-- The generator is unchanged (its PMP is decimal text); `pmp2sdp`'s memory is measured again when the precision
-  rises.
+  X and Y as text at every call below full precision). Before a call at another precision than its generation's
+  (`layout.json` `precision`; none: the problem's) the driver rewrites that generation at the call's precision as
+  the next generation (`precision.convert_checkpoint`): up, the limbs padded with zeros (the same numbers); down,
+  each number cut to its most significant limbs, as GMP's own floats truncate (2^-576 relative at 512 bits, far
+  below the digits a call keeps). Mixed precision turned on for a run whose checkpoint is at full precision starts
+  at the ladder's choice. A resume continues at the last record's `precision_next`; after a record in state
+  confirm, with its call again from the generation before it.
+- The generator works at the call's precision too (its request's `blockPrecision`, `pmp.model_section`: its
+  block tables and its arithmetic; at most `block_precision` when the problem sets one); at full precision the
+  request is the one without mixed precision, so the PMP is the same file. The block tables of each precision are
+  in a directory of their own, `blocks/p<bits>`: their file names have no precision, and the generator builds a
+  table only when its file is missing (before this was fixed, a full-precision call at a point
+  already solved at 512 bits read the 512-bit tables). `pmp2sdp`'s memory is measured again when the precision
+  rises (or taken from a bench row, 9).
 
 ### 10.2 Large steps (`large_steps = true`)
 
@@ -438,8 +482,11 @@ against a whole call's fixed cost.
 
 - c = cos(Δx/α, the previous Δx/α), α = `alpha_d`. m = 1 while cooling down, when c ≤ 0.99 or the call climbed;
   2 when c ≤ 0.999; else ⌊0.5/α⌋ within [1, 8]; 1 when x + m·Δx leaves the box.
-- After a call that started m > 1 steps ahead: `findMinimumQ` changed → `stopped: findMinimumQ changed after a
-  step m times ahead`; N changed sign → no more large steps in this run; more than 3 + 1.5(m − 1) iterations, or
+- After a call that started m > 1 steps ahead: `findMinimumQ` from false to true (the path left the allowed
+  region) → `stopped: findMinimumQ changed to true after a step m times ahead (left the allowed region)`; from true
+  to false (entering it, the usual path of a run started outside; N changes sign with it) → m = 1 for the
+  next 2 calls; otherwise N changed sign → no more large steps in this run (with `large_steps_sign_cooldown = k`: m = 1 for the
+  next k calls only); more than 3 + 1.5(m − 1) iterations, or
   c < 0.98 → m = 1 for the next 2 calls.
 - The BFGS step passed on is m·Δx; the record keeps the solver's Δx (`ext_step`) with `jump` = m; a resume goes
   on from x + m·Δx.
@@ -460,8 +507,12 @@ against a whole call's fixed cost.
   generations; any kill leaves the generation `checkpoint.json` names complete, but it may be a mid-call one.
 - So after each call, before writing its record k, bootlab makes `checkpoint/kept/<k>/`: hard links to that
   generation's rank files, copies of `checkpoint.json` and `block_timings`, and `layout.json` (`nodes`,
-  `node_type`, `ppn`, `precision`, `generation`), built as `kept/<k>.new` and renamed. Older kept directories are removed
-  after the record is written, so at most three generations exist at any time and two after each record.
+  `node_type`, `ppn`, `precision`, `generation`), built as `kept/<k>.new` and renamed. After the record is written the newest
+  `[skydive] keep_checkpoints` kept directories with k ≤ the records are left (2 when left out, at least 1) and
+  the older removed; the others are copies to go back to by hand, a resume loads the newest. So at most
+  keep + 2 generations exist at any time (the solver's current and backup besides) and min(records, keep) + 1
+  after each record. Mixed precision needs none but the newest: the full-precision solve after an optimal
+  call and a rise in precision convert the generation kept for the last record into new files (10.1).
 - **Resume**: the largest `kept/<k>` with k ≤ the number of records; newer and unfinished ones are removed;
   in `checkpoint/` only the rank files of other generations are removed; the kept files are linked back. A
   different layout (nodes, node type, processes per node) means a cold start. The run directory's file
@@ -570,7 +621,8 @@ with an address on that network). A host no rule matches stops the rank.
 `bootlab probe plan` (login node) → `probe node` jobs (one per type) and optionally `probe pair` jobs →
 `probe merge` → `bootlab site gen`. `probe plan --partition P` reads only partition P (`sinfo -p`), sends the
 jobs there and records `partition` in plan.json; `site gen` then keeps only the probed node types and writes
-`[slurm] partition = P` (the hand file's `[slurm]` wins). `probe plan --node H` probes H, busy or not.
+`[slurm] partition = P` (the hand file's `[slurm]` wins), its comment saying where it came from (`partition from the
+probe plan`, `hand`). `probe plan --node H` probes H, busy or not.
 
 | File | Content |
 |---|---|
@@ -600,13 +652,15 @@ jobs there and records `partition` in plan.json; `site gen` then keeps only the 
 ## 16. Regression
 
 `bootlab regress [--site] [--node] [--time] [--dry]` writes `examples/ising` at Λ = 11 with three steps to
-`<runs>/regress-input-<time>/` and submits one whole-node job running `regress run`; `regress check <run
+`<runs>/regress-input-<time>-<pid>/` (two in the same second do not collide) and submits one whole-node job running `regress run`; `regress check <run
 dir>` compares any run directory. The reference is `tests/reference/ising-l11/bt-steps.json` (the reference
 program's first three steps at full precision). Each number must agree to ≥ 130 significant digits
 (computed with `decimal` at 500 digits; standard library only); discrete values must be equal. The run
 directory gets `regress.json` (`passed`, `least`, per-step digits, problems).
 
-Unit tests: `python/bin/python3 -m unittest discover -s tests` (no cluster needed; the site tests use neutral
+Unit tests: `bin/bootlab selftest` (all of them, the same as `python/bin/python3 -m unittest discover -s tests`;
+`install.sh` runs it and only warns on a failure, its own gate being an import of every module, `bin/bootlab`
+starting and the quick `tests/test_install.py`, `tests/test_regress.py`; no cluster needed; the site tests use neutral
 fixtures in `tests/fixtures/sites/`). `tests/test_physics.py` checks the physics layer against recorded
 outputs of the reference program's parameter checks (6 models, 14 cases).
 
@@ -618,7 +672,8 @@ outputs of the reference program's parameter checks (6 models, 14 cases).
   `cli.py` subcommand. Keep the rules: check inputs in `inputs.load`, end on abnormal results, choose resources
   from bench data, and compare with a reference before use.
 - **A new generator** (spinning operators): any program that reads a request like section 6 and writes the PMP
-  of section 7 plugs in through the site's `generator`.
+  of section 7 plugs in through the site's `generator`; one with its own models and PMP format goes under
+  `[generators.<name>]` as in section 19.
 - **A new site**: probe and generate (section 15), or copy `sites/_template`.
 - **New measurements**: append rows to the bench files in the same form, with their source.
 - Tests: add unit tests under `tests/`; numerical changes need a regression (section 16) or a comparison of the
@@ -697,3 +752,103 @@ to Pss).
 **What has not been tested**: `memory_guard = "systemd"` and `submit --systemd` (unit tests cover the commands
 only), and a machine that really has no Slurm (the acceptance ran on a compute node with Slurm hidden). See the
 README's known limitations.
+
+<a id="current-bootstrap"></a>
+## 19. Spinning operators: built-in models, the scan and Skydive (current bootstrap)
+
+DSD's Haskell code for spinning external operators (stress-tensors-3d, branch `jt-z2-charge-conjugation-invariant`
+478a3fd, on hyp-1.3.36) plugs in as a second PMP generator. Its physics (three-point structures, conservation,
+Ward identities, crossing) stays in upstream's Haskell, unchanged; what can be swapped stays data.
+
+**Built-in models.** A model card `bootlab-builtin/1` (JSON) replaces `bt-model/2` for these models: `generator`
+(a name under the site's `[generators.<name>]`), `bound` (the Bound the generator registers, e.g. `JJJJ3d`),
+`coordinates` (the bound's own, none for ⟨JJJJ⟩), `channels` (the channels the spectrum may name and their spin
+rule), `objectives` (the kinds allowed) and `lambda` (the dimension of the external OPE direction). Adding an
+upstream bound is one line in the generator's registry (module `StressTensors3d.Bootlab.Pmp` of the generator's source) and a
+card. Example: `examples/jjjj/`.
+
+- Spectrum: `bootlab-spectrum/1` as in section 3.2. For ⟨JJJJ⟩ the channels are the parity sectors `P+`, `P-`;
+  `delta` is upstream's `Fixed`, `above_unitarity` its `RelativeUnitarity`.
+- Objective: `kind = "feasibility"` (`lambda` optional) or `"ope_bound"` (`lambda`, `direction = "upper" | "lower"`).
+  `lambda` may refer to point parameters, e.g. `["1", "x"]`; the parameters referred to become coordinates.
+- `run.toml`: `[numerics]` is exactly upstream's `SimpleBoundParams`: `lambda` (nmax = (Λ+1)/2), `order`,
+  `num_poles`, `max_spin` (spins 0…max_spin), `block_precision`. `[scan] points` lists the points, each an exact
+  value per coordinate (strings, no floats). `[solver]` overrides solver flags by name (a value replaces the
+  flag's value, `true` adds a switch, `false` removes it). A built-in model has `[scan]` or `[skydive]`, one of
+  them; a `bt-model/2` model with `[scan]` is an error.
+
+**Interface 1′: the generator's input.** `stress-tensors-3d-exec pmp <request.json>`: the bound's name, the
+numerics, every point's spectrum (spins resolved) and objective as exact JSON numbers, the output and block
+directories, the cores. Each point's Bound is built by upstream's own constructor (for ⟨JJJJ⟩
+`JJJJ2025.jjjj3dBound`), so keys, precision and solver parameters are upstream's. All points go to upstream's
+`buildBounds` at once, which stops at the PMP parts. Per point it writes `pmp.nsv`, `sdpb.args.json` (the solver
+arguments upstream would pass) and `bound.json` (the key). The generator runs on the host with its own
+environment (`[generators.<name>.env]`); bootlab sets its scheduler's memory to the step's `--mem` and declares no
+node-local paths (upstream deletes every output on a node-local path, the final parts included).
+
+**Interface 2: the PMP is SDPB 3.1.** The generator writes SDPB 3.1 JSON (`prefactor`, and `reducedPrefactor` when
+the bound sets `num_poles`: 3.1's reduced sampling; rewriting it as 3.0 would be a different SDP). So there is no
+conversion: the site's `[generators.<name>]` names its `pmp2sdp` and `sdpb` (3.1.0), which must be in the site's
+image (bootlab-exec r6 and later carry both 3.0sky and 3.1.0). The scalar chain is unchanged (3.0sky).
+
+**The scan.** One solve per point: generator, pmp2sdp, sdpb, one line in `solves.jsonl` (point, primal, dual,
+gap, N, blocks, processes, seconds). The block directory is shared within the run. Solver arguments: the
+generator's `sdpb.args.json`, `maxRuntime` set to the job's time left less 15 minutes, then `[solver]`. A failure
+ends the scan; `resume` goes on from the first point without a line. Commands are unchanged (`run`, `resume`,
+`summary`); a scan runs on one node; its scratch is chosen as a Skydive's. Solver processes come from the bench as
+in section 9 (no measurement: all physical cores).
+
+**Skydive.** The loop of sections 10–12 (records, checkpoints, resume, endings unchanged; in code `builtin.Skydive`, a
+`skydive.Run` with a few hooks overridden), with four changes.
+- PMP: the centre and its neighbours are built in one `builtin.write_request` / `builtin.generate`; their SDPs
+  by the generator's `pmp2sdp`. The generator writes into the run's one directory `<scratch>/pmp`, kept from step
+  to step (a scan: from point to point); its scheduler skips the parts that exist, so a step builds only the parts
+  that depend on the point. A resume on another node or in another job builds them all again.
+- Solver: the site's `dynamical_sdp`, unless `[generators.<name>]` names one. 3.0sky reads the SDPs of pmp2sdp
+  3.1.0.
+- Solver options: the bound's own (the centre's `sdpb.args.json`), then `maxRuntime`, `[solver]` and the step's
+  stopping threshold. The threshold's setting is the bound's, which only the generator gives, so the next step's PMPs are
+  made first and its options read from them. The precision is the bound's, `block_precision`; every step checks
+  that the generator's is the call's and that the other options are the first step's, and fails if not.
+- Objective: dynamical_sdp minimizes the SDP's objective N over the coordinates, so only `ope_bound` is taken.
+  For an upper bound the dual is minus the bound, and the run goes to where the bound is largest. N's sign then
+  says nothing about allowed or excluded: `find_boundary_direction` and `stop_on_negative` are errors, and an
+  optimal ending is `converged: optimum`.
+
+`large_steps` works as it is; with `mixed_precision` the generator builds the bound at the call's precision too
+(the request's `precision` sets both the blocks' and the solver's). The coordinates are the card's `coordinates` (sent as the request's
+`coords`) and then the point parameters of the spectrum and objective; ⟨JJJJ⟩ has only point parameters, and
+`examples/jjjj/skydive.toml` moves x = 12γ. A bound with external dimensions later puts them in its card; the
+interface stays the same.
+
+**Verified** (against upstream's own run of the same bound and points): ⟨JJJJ⟩ in d = 3 at Λ = 11 (nmax 6, order
+60, 20 poles, spins 0–40, 768 bits), `ope_bound` upper with `lambda = ["1", "x"]`, one `P+` spin-2 gap at 3.5,
+three points 12γ = 0, −1, +1, on one node. The 63 PMP parts are byte-identical to upstream's; pmp2sdp 3.1.0's SDP
+is byte-identical in 124 of 126 files, the other two (`control.json`, `pmp_info.json`) differ only in paths; the
+three duals agree to 172.9 digits or more and the primals to 186.6 or more (gap about 9e-31), N = 116 and 61
+blocks in both (the same in every acceptance run, the last on bootlab-exec r6).
+
+**Verified (Skydive, r7)**: ⟨JJJJ⟩ at Λ = 11, coordinate x = 12γ, upper bound. dynamical_sdp 3.0sky reads pmp2sdp
+3.1.0's SDPs and, solving to optimal, agrees with sdpb 3.1.0 to 31–32 digits (gaps about 3e-31 on both sides); the
+Skydive's dN/dx agrees with sdpb 3.1.0's central difference over x ± 1e-10 to 19.5–19.6 digits, with the same sign;
+from x = −0.11 the run ends `converged: optimum` after 60 steps (resumed once on the way); on both sides of the end,
+± 1e-6 and ± 1e-10, B is smaller, the difference slope is about 0 and the difference curvature agrees with the
+BFGS Hessian to 6 digits; a loop written out from upstream's source agrees with bootlab's first 5 steps to 134
+digits or more; `large_steps` reaches the maximum from x = 0.5 in 30 steps (0.34 without); `mixed_precision`, 12
+steps at 512 bits, agrees with full precision to 78–86 digits, above section 10.1's floor of 55–57.
+
+**Known behaviour**: far from the maximum, where N is concave, BFGS does not update its Hessian, the external step
+is 0.5–0.8% of a Newton step and the gap shrinks by about 1.5% a step: ⟨JJJJ⟩ from x = 0.5 without large steps gets
+only to 0.22 in 60 steps. `large_steps` gets round it, reaching the maximum in 30 steps, so turn it on for a start far away (the
+default stays off; `examples/jjjj/skydive.toml` turns it on). Near
+the maximum α is about 0.78 and the gap shrinks to about 0.3 of itself each step, converging within tens of steps.
+
+**Not verified**: the `feasibility` objective; isolated operators; gaps in `P-`; other Λ; other upstream bounds
+(none registered: TTTT3d needs a half-integer spin list in `[numerics]`); local mode for the generator (it is
+started with srun only); Skydive of a bound with external dimensions (none registered yet); Navigator for
+built-in models; several nodes in a built-in model's Skydive.
+
+**Solver processes** (measured at 12γ = 0 with a quarter, a half and all physical cores, one solve each; the site's
+bench files): the scan takes the fastest. On the development cluster that was half the cores on its largest nodes
+(256 physical cores) and all of them on the smaller ones (96 and 128). Only ⟨JJJJ⟩ at Λ = 11 is measured; the bench picks the measured problem nearest in N and blocks among
+the rows of the solver's SDPB version (3.0sky, 3.1.0), all rows when that version has none.

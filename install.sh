@@ -9,7 +9,10 @@
 #    with the image's own loader and libraries, without LD_LIBRARY_PATH or PYTHONHOME;
 # 3. writes <root>/bootlab.toml (image, and site and runs when given) unless it exists;
 # 4. writes <root>/bin/bootlab, the command (that Python on <root>/src, no PYTHONPATH), unless it exists;
-# 5. runs the unit tests with that Python.
+# 5. checks the installation quickly, a failure stopping it: every module of src/bootlab imports, bin/bootlab
+#    starts, and two quick unit tests (tests/test_install.py, tests/test_regress.py) pass;
+# 6. runs bin/bootlab selftest (every unit test): a failure there is a warning only, as most of those tests are
+#    not about the installation (run it again any time with bin/bootlab selftest).
 # Nothing is overwritten or removed: an existing <root>/python stops the installation.
 set -euo pipefail
 root=$(cd "$(dirname "$0")" && pwd)
@@ -58,7 +61,7 @@ else
   mkdir -p "$root/bin"
   cat > "$root/bin/bootlab" <<'EOF'
 #!/bin/sh
-# bootlab's command, written by install.sh: bin/bootlab <run | resume | submit | summary | regress | probe | site> ...
+# bootlab's command, written by install.sh: bin/bootlab <run | resume | submit | summary | regress | selftest | probe | site> ...
 # The install root from this file's own place (a link to it works too); its Python, isolated (-I: no PYTHONPATH
 # read, no current directory on the path), with <root>/src put on the path in the process: nothing is added to
 # the environment, so the children (srun, apptainer, the steps) see no PYTHONPATH.
@@ -68,5 +71,15 @@ EOF
   chmod +x "$root/bin/bootlab"
   echo "wrote $root/bin/bootlab"
 fi
-cd "$root"
-"$py/bin/python3" -m unittest discover -s tests
+"$py/bin/python3" -I -c 'import importlib, pkgutil, sys; sys.path.insert(0, sys.argv[1]); import bootlab
+for m in pkgutil.iter_modules(bootlab.__path__): importlib.import_module("bootlab." + m.name)' "$root/src" \
+  || die "a module of $root/src/bootlab does not import with the image's Python"
+"$root/bin/bootlab" --help > /dev/null || die "$root/bin/bootlab does not start"
+(cd "$root/tests" && "$py/bin/python3" -m unittest -q test_install test_regress) \
+  || die "the installation's quick tests failed (tests/test_install.py, tests/test_regress.py)"
+echo "installation checked: modules import, bin/bootlab starts, quick tests pass"
+if "$root/bin/bootlab" selftest; then
+  echo "selftest: every unit test passed"
+else
+  echo "install.sh: warning: bin/bootlab selftest failed (above); the installation itself is checked and in place" >&2
+fi

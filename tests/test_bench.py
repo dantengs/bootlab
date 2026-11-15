@@ -60,7 +60,7 @@ class Rows(unittest.TestCase):
 
     def test_a_new_file(self):
         with tempfile.TemporaryDirectory() as d:
-            path = benchrun.append_rows(Path(d) / "bench", "cpu128", 128, [self.ROW])
+            path = benchrun.append_rows(Path(d) / "bench", "cpu128", 128, {"solver": [self.ROW]})
             data = json.loads(path.read_text())
             self.assertEqual((data["format"], data["node_type"], data["physical_cores"]),
                              ("bootlab-bench/1", "cpu128", 128))
@@ -73,9 +73,32 @@ class Rows(unittest.TestCase):
             old = {"format": "bootlab-bench/1", "node_type": "cpu128", "physical_cores": 128,
                    "solver": [{**self.ROW, "procs_per_node": 128, "s_per_iter": 0.7}], "sdp_build": [{"x": 1}]}
             (Path(d) / "cpu128.json").write_text(json.dumps(old))
-            data = json.loads(benchrun.append_rows(Path(d), "cpu128", 128, [self.ROW]).read_text())
+            data = json.loads(benchrun.append_rows(Path(d), "cpu128", 128, {"solver": [self.ROW],
+                                                                            "sdp_build": [self.SDP]}).read_text())
             self.assertEqual([r["procs_per_node"] for r in data["solver"]], [128, 64])
-            self.assertEqual(data["sdp_build"], [{"x": 1}])
+            self.assertEqual(data["sdp_build"], [{"x": 1}, self.SDP])
+            self.assertEqual(bench.sdp_build_row(data, "ising-oe", 11, 785, 32), self.SDP)
+
+    SDP = {"problem": "ising-oe L=11 (bootlab bench)", "model": "ising-oe", "lambda": 11, "N": 274, "blocks": 46,
+           "precision": 785, "program": "pmp2sdp 3.0sky", "instances": 1, "procs": 32, "sdps": 1, "wall": 3.1,
+           "per_sdp": 3.1, "peak_gb_per_instance": 1.5, "held_mb": 1536, "cgroup_peak_mb": 1700,
+           "source": "bootlab bench 2026-11-15, 2 x CPU, 128 physical cores, 251 GB"}
+
+    def test_sdp_build_row(self):
+        """Only bootlab bench's rows (with held_mb) of this model, Lambda, precision and processes; the last."""
+        later = {**self.SDP, "held_mb": 1600}
+        b = {"sdp_build": [{"problem": "hand", "procs": 32, "peak_gb_per_instance": 9}, self.SDP, later]}
+        self.assertEqual(bench.sdp_build_row(b, "ising-oe", 11, 785, 32), later)
+        for args in (("ising-oe", 11, 512, 32), ("ising-oe", 11, 785, 31), ("ising-oe", 19, 785, 32), ("x", 11, 785, 32)):
+            self.assertIsNone(bench.sdp_build_row(b, *args))
+        self.assertIsNone(bench.sdp_build_row({}, "ising-oe", 11, 785, 32))
+
+    def test_precisions(self):
+        """The precisions a run calls at first: with mixed precision the ladder's choice, then full."""
+        p = SimpleNamespace(solver_precision=lambda: 1024, run={"skydive": {"gap_upper_limit": "1e-12"}})
+        self.assertEqual(benchrun.precisions(p), [1024])
+        p.run["skydive"]["mixed_precision"] = True
+        self.assertEqual(benchrun.precisions(p), [512, 1024])
 
 
 SINFO = """\
@@ -127,11 +150,15 @@ class OnePartition(unittest.TestCase):
         p = {"plan": {"partition": "p1", "apptainer_setup": ""}, "nodes": {"cpua-1": [rec]}, "pairs": [],
              "types": {"cpua": {"hosts": ["cpua-1", "cpua-2"], "physical_cores": 256, "mem_mb": 376000},
                        "cpub": {"hosts": ["cpub-1"], "physical_cores": 128, "mem_mb": 253000}}}
-        site, _, _ = sitegen.generate(p, {}, set())
+        site, notes, _ = sitegen.generate(p, {}, set())
         self.assertEqual(list(site["node_types"]), ["cpua"])     # the probed type only
         self.assertEqual(site["slurm"], {"partition": "p1"})
-        site, _, _ = sitegen.generate(p, {"slurm": {"partition": "p2", "time": "1:00:00"}}, set())
+        self.assertIn("[slurm]   # partition from the probe plan\n", sitegen.write_toml(site, notes))
+        self.assertEqual(sitegen.generate(p, {"slurm": {"time": "1:00:00"}}, set())[1]["slurm"],
+                         "partition from the probe plan, the rest hand")
+        site, notes, _ = sitegen.generate(p, {"slurm": {"partition": "p2", "time": "1:00:00"}}, set())
         self.assertEqual(site["slurm"], {"partition": "p2", "time": "1:00:00"})   # the hand file first
+        self.assertEqual(notes["slurm"], "hand")
         del p["plan"]["partition"]
         site, _, _ = sitegen.generate(p, {}, set())
         self.assertEqual(sorted(site["node_types"]), ["cpua", "cpub"])            # no partition: as before

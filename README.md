@@ -61,8 +61,8 @@ automatically. A run is resumed by hand from the last kept solver checkpoint.
 - A Linux x86-64 cluster with **Slurm ≥ 21.08** (`srun --exact`, `--overlap`) and an `srun` MPI plugin that
   the image's Open MPI 4.1 can use (pmix by default).
 - **Apptainer ≥ 1.1** on the login and compute nodes.
-- The **bootlab execution image** (`bootlab-exec`, revision r5 or later). It is not yet distributed with this
-  repository; see [Known limitations](#known-limitations).
+- The **bootlab execution image** (`bootlab-exec`, revision r5 or later; the current one is r8, see
+  [Getting the image](#getting-the-image)).
 - A file system shared by the nodes of a job, for the run directories. It must support hard links.
 - Node-local scratch disk recommended (the probe measures whether it is faster than the shared disk).
 - Optional: cgroup v2 as Slurm sets it up (for the `pmp2sdp` memory watchdog; without it the watchdog is off
@@ -74,19 +74,31 @@ Or one Linux workstation without Slurm, with Apptainer and the image ([local mod
 
 No Python is needed on the host.
 
+## Getting the image
+
+The execution image is on the GitHub Container Registry (378 MB):
+
+```bash
+apptainer pull bootlab-exec-2026.11-r8.sif oras://ghcr.io/dantengs/bootlab-exec:2026.11-r8
+sha256sum bootlab-exec-2026.11-r8.sif       # cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
+```
+
+`install.sh` checks the sha256 again. The licenses of the programs in the image are in
+`/opt/bootlab/licenses` inside it.
+
 ## Quick start
 
 ```bash
 git clone <this repository> bootlab && cd bootlab
 module load apptainer                     # or however your cluster puts apptainer on PATH
-./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <the image's sha256>
+./install.sh --image /path/to/bootlab-exec-2026.11-r8.sif --sha256 cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
 
 # what the probe cannot know (your Slurm partition, time limit); it may stay empty: then the cluster's default
 # partition and a 48-hour limit are used
 touch mysite.hand.toml
 
 # probe the cluster (one small job per node type: 8 cores, 16 GB, 15 minutes), merge, generate the site
-bin/bootlab probe plan --sif /path/to/bootlab-exec-r5.sif --out probe --submit
+bin/bootlab probe plan --sif /path/to/bootlab-exec-2026.11-r8.sif --out probe --submit
 bin/bootlab probe merge probe              # after the probe jobs have finished
 bin/bootlab site gen --probe probe/probe.json --hand mysite.hand.toml --out sites/mysite
 echo 'site = "mysite"' >> bootlab.toml
@@ -115,9 +127,9 @@ Prerequisites:
 - No Python needed on the host, as on a cluster.
 
 ```bash
-./install.sh --image /path/to/bootlab-exec-r5.sif --sha256 <the image's sha256>
-bin/bootlab probe local --sif /path/to/bootlab-exec-r5.sif --out probe   # here, a few minutes: cores, memory,
-                                                                         # disks, mpirun on every core
+./install.sh --image /path/to/bootlab-exec-2026.11-r8.sif --sha256 cfd59e85b0aefbf1c5f4585f5bf54600158edb723ba6d679694f36a77f1ac5ac
+bin/bootlab probe local --sif /path/to/bootlab-exec-2026.11-r8.sif --out probe   # here, a few minutes: cores, memory,
+                                                                                    # disks, mpirun on every core
 touch ws.hand.toml
 bin/bootlab site gen --probe probe/probe.json --hand ws.hand.toml --out sites/ws
 echo 'site = "ws"' >> bootlab.toml
@@ -148,6 +160,7 @@ How bootlab chooses:
 | Interfaces for developers: every layer, file format and configuration key | [docs/en/interfaces.md](docs/en/interfaces.md) | [docs/zh/interfaces.md](docs/zh/interfaces.md) |
 | bootlab compared with simpleboot and Hyperion | [docs/en/comparison.md](docs/en/comparison.md) | [docs/zh/comparison.md](docs/zh/comparison.md) |
 | Writing a new model with an AI assistant | [docs/en/writing-models-with-ai.md](docs/en/writing-models-with-ai.md) | [docs/zh/writing-models-with-ai.md](docs/zh/writing-models-with-ai.md) |
+| Design (not implemented yet): feasibility, bisection, Delaunay search and the navigator | [docs/en/design-search-algorithms.md](docs/en/design-search-algorithms.md) | [docs/zh/design-search-algorithms.md](docs/zh/design-search-algorithms.md) |
 
 ## Roadmap
 
@@ -165,7 +178,6 @@ fixed interfaces. The order is not fixed.
 
 ## Known limitations
 
-- The execution image is not public yet. Without it bootlab runs only its unit tests.
 - Only d = 3 and external scalars (the generator's `bt-model/2` format and scalar_blocks).
 - A converter from simpleboot's AutoEqu/VBlock files to `bt-model/2` exists in the authors' toolchain and is
   not part of this release; models are written by hand or with an AI assistant

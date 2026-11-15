@@ -30,12 +30,13 @@ sif = "/path/to/bootlab-exec-2026.11-r5.sif"
 # Bound into the container. The runs directory must be under one; the scratch directory chosen at the start
 # and the run directory are added when they are not.
 binds = ["/shared"]
-python = "/shared/python3.12/bin/python3"
+# python = "/shared/python3.12/bin/python3"   # only for a Python outside the installation
 setup = "setup.sh"                       # sourced by the job, and by a remote shell with transfer = "ssh"
 generator = "/opt/bootlab/bin/generator" # in the image
 pmp2sdp = "pmp2sdp_3.0sky"               # in the image
 dynamical_sdp = "dynamical_sdp_RV1B_3.0sky"
-runs = "/shared/bootlab/runs"            # run directories (with the solver's checkpoint), Slurm's output
+# runs = "/shared/bootlab/runs"          # run directories (with the solver's checkpoint), Slurm's output;
+#                                        # better in bootlab.toml, so that two installations keep apart
 # The run's large files (PMP, SDP, the generator's block tables): candidates in order,
 # the first that every node of the job resolves to the same path and can write ($VARS are the node's own);
 # "shared" = <run dir>/work on the runs file system (then nothing is copied between nodes, every node reads

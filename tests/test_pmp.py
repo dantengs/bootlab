@@ -37,6 +37,21 @@ class Request(unittest.TestCase):
                                           "gaps": [{"channel": "rep1+", "spins": [0], "gap": 3},
                                                    {"channel": "rep2+", "spins": [0], "gap": 3}]})
 
+    def test_precision_of_the_call(self):
+        """Below the problem's precision (a mixed precision call) the generator works at the call's; at it, the
+        request is the one without bits."""
+        p = inputs.load(EXAMPLE)          # Lambda 11: solver 785 bits, blocks 1024 (simpleboot's preset)
+        pts = {"c": {"deltaSig": "0.518", "deltaEps": "1.4", "theta": "0.956"}}
+        with tempfile.TemporaryDirectory() as d:
+            model = {b: json.loads(pmp.write_request(p, Path("/m/model.json"), pts, Path(d) / str(b), Path("/b"), 64,
+                                                     b).read_text())["model"] for b in (None, 512, 785)}
+        self.assertEqual(model[None], model[785])
+        self.assertNotIn("blockPrecision", model[785])
+        self.assertEqual(model[512], {**model[785], "blockPrecision": 512})
+        p.numerics["block_precision"] = 400
+        self.assertEqual(pmp.model_section(p, Path("/m"), 512)["blockPrecision"], 400)
+        self.assertEqual(pmp.model_section(p, Path("/m"), 785)["blockPrecision"], 400)
+
     def test_generator_in_the_image(self):
         """The generator runs in the image like the other programs: apptainer exec of site.toml's sif, the
         generator's path there, the driver's environment (no bt site scripts or libraries from the host)."""

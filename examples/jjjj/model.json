@@ -1,0 +1,13 @@
+{
+ "format": "bootlab-builtin/1",
+ "about": "<JJJJ> of a conserved U(1) current in 3d: upstream's JJJJ3d (stress-tensors-3d jt branch, Bounds/JJJJ3d.hs, 7 crossing equations), the bound JJJJ2025.jjjj3dBound builds. Channels are the spatial parity sectors of the exchanged operators. Objectives: feasibility, with or without fixed (lambda_JJT_ward, lambda_JJT); ope_bound, the upper or lower bound on the external T term along lambda.",
+ "generator": "current",
+ "bound": "JJJJ3d",
+ "coordinates": [],
+ "channels": [
+  {"name": "P+", "spins": "all"},
+  {"name": "P-", "spins": "all"}
+ ],
+ "objectives": ["feasibility", "ope_bound"],
+ "lambda": 2
+}

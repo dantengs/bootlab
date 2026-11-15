@@ -12,6 +12,7 @@ from bootlab import precision
 
 B = 2 ** 64
 FIXTURE = Path(__file__).parent / "fixtures" / "checkpoint-384"
+FIXTURE_785 = Path(__file__).parent / "fixtures" / "checkpoint-785"
 
 
 def record(value: Fraction, n: int) -> bytes:
@@ -70,21 +71,135 @@ class Choice(unittest.TestCase):
         self.assertEqual(precision.choose(512, "1e-30"), 512)
         self.assertEqual(precision.choose(384, "1e-30"), 384)
 
-    def test_never_lowered(self):
+    def test_low_stays(self):
         line = {"verdict": "stepped", "precision": 512, "gap": "1", "find_minimum": False, "climbed": False,
                 "call_iterations": 2}
-        self.assertEqual(precision.next_precision(line, [], 1024), (512, None))
+        self.assertEqual(precision.decide(line, [], 1024), {"precision_state": "low", "precision_next": 512})
 
     def test_raised_by_the_gap(self):
         line = {"verdict": "stepped", "precision": 384, "gap": "1e-25", "find_minimum": False, "climbed": False,
                 "call_iterations": 2}
-        bits, note = precision.next_precision(line, [], 1024)
-        self.assertEqual(bits, 512)
-        self.assertIn("below 30", note)
+        d = precision.decide(line, [], 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("low", 512))
+        self.assertIn("below 30", d["precision_note"])
 
-    def test_full_stays_full(self):
-        line = {"verdict": "aborted", "precision": 785, "gap": None}
-        self.assertEqual(precision.next_precision(line, [], 785), (785, None))
+    def test_formula_locks(self):
+        """Full 768, gap 1e-60: 512 bits keep 23 digits and nothing between: locked."""
+        line = {"verdict": "stepped", "precision": 512, "gap": "1e-60", "find_minimum": False, "climbed": False,
+                "call_iterations": 2}
+        d = precision.decide(line, [], 768)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("locked", 768))
+        self.assertIn("no lower precision does", d["precision_note"])
+
+
+def call(bits, it=3, state=None, climbed=False, find_minimum=False, verdict="stepped", gap="1e-12", first=False):
+    """A record of a call at `bits` that left precision_state `state` (None: a record from before dynamic
+    precision, with precision_next only: full after a call at full, else bits)."""
+    line = {"verdict": verdict, "precision": bits, "gap": gap, "climbed": climbed, "find_minimum": find_minimum,
+            "call_iterations": it}
+    if first:
+        line["first_call"] = True
+    if state:
+        line["precision_state"] = state
+        line["precision_next"] = 1024 if state in ("confirm", "high", "locked") else bits
+    else:
+        line["precision_next"] = bits
+    return line
+
+
+class Decide(unittest.TestCase):
+    """The states of precision.decide at full 1024 bits, gap 1e-12 (512 bits keep 52 digits)."""
+    LOW = [call(512, 180, "low", first=True), call(512, 3, "low"), call(512, 3, "low")]
+
+    def test_confirm(self):
+        d = precision.decide(call(512, 3, find_minimum=True), self.LOW, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("confirm", 1024))
+        self.assertIn("the same call again at full precision", d["precision_note"])
+
+    def test_confirmed_the_paths(self):
+        """The call again at full fails the check too: low again at the ladder's choice."""
+        hist = self.LOW + [call(512, 3, "confirm", find_minimum=True)]
+        d = precision.decide(call(1024, 3, find_minimum=True), hist, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("low", 512))
+        self.assertIn("confirmed at full precision (findMinimumQ changed", d["precision_note"])
+
+    def test_confirmed_the_precisions(self):
+        hist = self.LOW + [call(512, 3, "confirm", find_minimum=True)]
+        d = precision.decide(call(1024, 3), hist, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("high", 1024))
+        self.assertIn("healthy at full precision where 512 bits were not", d["precision_note"])
+
+    def test_aborted_confirmed(self):
+        """Aborted at 512 and again at full (no gap): locked (the run ends there)."""
+        hist = self.LOW + [call(512, 7, "confirm", verdict="aborted", gap=None)]
+        d = precision.decide(call(1024, 7, verdict="aborted", gap=None), hist, 1024)
+        self.assertEqual(d["precision_state"], "locked")
+
+    # a call at 512 failing the check, the call again at full (healthy: high), one more healthy call at full
+    UP = [call(512, 3, "confirm", find_minimum=True), call(1024, 3, "high")]
+    HIGH = LOW + UP + [call(1024, 3, "high")]
+
+    def test_back_after_three(self):
+        """The confirming call and two more healthy calls at full: back to 512; after one more only: still high."""
+        self.assertEqual(precision.decide(call(1024, 3), self.HIGH[:-1], 1024)["precision_state"], "high")
+        d = precision.decide(call(1024, 3), self.HIGH, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("low", 512))
+        self.assertIn("back to 512 bits (return 1 of 2)", d["precision_note"])
+
+    def test_climbing_neither_counts_nor_breaks(self):
+        hist = self.LOW + self.UP + [call(1024, 30, "high", climbed=True)]
+        self.assertEqual(precision.decide(call(1024, 3), hist, 1024)["precision_state"], "high")
+        self.assertEqual(precision.decide(call(1024, 3), hist + [call(1024, 3, "high")], 1024)["precision_state"],
+                         "low")
+
+    def test_unhealthy_starts_again(self):
+        """A call at full with 9 iterations (over max(4, 2 x 3)) breaks the run of healthy calls."""
+        hist = self.HIGH + [call(1024, 9, "high")]
+        for more, state in ((0, "high"), (1, "high"), (2, "low")):
+            self.assertEqual(precision.decide(call(1024, 3), hist + [call(1024, 3, "high")] * more, 1024)
+                             ["precision_state"], state)
+
+    def test_settings(self):
+        """After 1 healthy call, 20 digits above 30: 512 bits at gap 1e-12 (52 digits), 768 at 1e-30 (512: 41)."""
+        o = {"precision_return_after": 1, "precision_return_margin": 20}
+        hist = self.LOW + self.UP
+        self.assertEqual(precision.decide(call(1024, 3), hist, 1024, o)["precision_next"], 512)
+        self.assertEqual(precision.decide(call(1024, 3, gap="1e-30"), hist, 1024, o)["precision_next"], 768)
+
+    def test_limit_locks(self):
+        """Gone back down twice (the limit): locked at the next call at full."""
+        twice = self.HIGH + [call(1024, 3, "low")] + [call(512, 3, "low")] * 5 + self.UP + \
+            [call(1024, 3, "high"), call(1024, 3, "low")] + [call(512, 3, "low")] * 5
+        self.assertEqual(len(precision.returns(twice, 1024)), 2)
+        d = precision.decide(call(1024, 3), twice + self.UP, 1024)
+        self.assertEqual(d["precision_state"], "locked")
+        self.assertIn("the limit (2)", d["precision_note"])
+
+    def test_recent_trigger_locks(self):
+        """A failed check within 5 calls of going back down: locked at once, no confirming call; after 5, confirm."""
+        back = self.HIGH + [call(1024, 3, "low")]
+        d = precision.decide(call(512, 3, find_minimum=True), back + [call(512, 3, "low")], 1024)
+        self.assertEqual(d["precision_state"], "locked")
+        self.assertIn("calls after going back down", d["precision_note"])
+        later = back + [call(512, 3, "low")] * 5
+        self.assertEqual(precision.decide(call(512, 3, find_minimum=True), later, 1024)["precision_state"], "confirm")
+
+    def test_optimal_locks(self):
+        d = precision.decide({**call(512, 1), "verdict": "optimal", "gap": "1e-31"}, self.LOW, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("locked", 1024))
+        self.assertIn("optimal at 512 bits", d["precision_note"])
+        self.assertEqual(precision.decide(call(1024, 3), self.LOW + [call(1024, 1, "locked")], 1024),
+                         {"precision_state": "locked", "precision_next": 1024})
+
+    def test_old_records(self):
+        """Records from before dynamic precision (a mixed run: step 2 sent it to full, steps 3-6 at full):
+        high from step 3 on; four healthy calls at full: back to 512."""
+        old = [call(512, 370, first=True), {**call(512, 10), "precision_next": 1024}, call(1024, 8),
+               call(1024, 3), call(1024, 3)]
+        old[2]["precision_next"] = old[3]["precision_next"] = old[4]["precision_next"] = 1024
+        self.assertEqual([precision.state_of(l, 1024) for l in old], ["low", "high", "high", "high", "high"])
+        d = precision.decide(call(1024, 3, gap="1.9e-15"), old, 1024)
+        self.assertEqual((d["precision_state"], d["precision_next"]), ("low", 512))
 
 
 def stepped(it, climbed=False, find_minimum=False, first=False):
@@ -123,13 +238,9 @@ class Health(unittest.TestCase):
         outside = [stepped(180, first=True, find_minimum=True), stepped(3, find_minimum=True)]
         self.assertIsNone(precision.health(stepped(3), outside))
 
-    def test_aborted_and_optimal(self):
+    def test_aborted(self):
         aborted = {"verdict": "aborted", "precision": 384, "gap": None, "call_iterations": 7}
-        self.assertEqual(precision.next_precision(aborted, self.HISTORY, 785)[0], 785)
-        opt = {**stepped(1), "verdict": "optimal", "gap": "1e-31"}
-        bits, note = precision.next_precision(opt, self.HISTORY, 785)
-        self.assertEqual(bits, 785)
-        self.assertIn("optimal at 384 bits", note)
+        self.assertIn("aborted at 384 bits", precision.health(aborted, self.HISTORY))
 
 
 class Checkpoint(unittest.TestCase):
@@ -151,11 +262,44 @@ class Checkpoint(unittest.TestCase):
             self.assertLessEqual(abs(got - v), abs(v) / Fraction(B) ** 6)
             self.assertEqual(got, value(src.read_bytes(), 16 * (1 + k // 6) + k * (12 + 64)))
 
-    def test_not_down(self):
-        src = self.d / "a"
+    def test_down(self):
+        """15 -> 8 limbs (785 -> 384 bits): each number cut to its 8 most significant limbs, within 2^-448 of it
+        relative; back up at 15 limbs the same as cut."""
+        src, down, up = self.d / "a", self.d / "b", self.d / "c"
         src.write_bytes(rank_file(VALUES, 15))
-        with self.assertRaises(SystemExit):
-            precision.convert_rank_file(src, self.d / "b", 15, 8)
+        precision.convert_rank_file(src, down, 15, 8)
+        precision.convert_rank_file(down, up, 8, 15)
+        for k, v in enumerate(VALUES):
+            got = value(down.read_bytes(), 16 + k * (12 + 64))
+            self.assertLessEqual(abs(got - v), abs(v) / Fraction(B) ** 7)
+            self.assertEqual(got, value(up.read_bytes(), 16 + k * (12 + 120)))
+
+    def test_real_checkpoint_down(self):
+        """A rank file of a real 785-bit generation (tests/fixtures/checkpoint-785: Ising Lambda 11 at
+        full precision, kept/4) to 512 bits and back (15 -> 10 -> 15 limbs): every number's exponent, sign and its
+        min(|size|, 10) most significant limbs byte for byte, zeros after them, and the files read to their end."""
+        a = FIXTURE_785.read_bytes()
+        down, up = self.d / "down", self.d / "up"
+        precision.convert_rank_file(FIXTURE_785, down, 15, 10)
+        precision.convert_rank_file(down, up, 10, 15)
+        b = up.read_bytes()
+        self.assertEqual(len(a), len(b))
+        i = numbers = cut = 0
+        while i < len(a):
+            self.assertEqual(a[i:i + 16], b[i:i + 16])
+            h, w = struct.unpack_from("<qq", a, i)
+            i += 16
+            for _ in range(h * w):
+                s = struct.unpack_from("<i", a, i)[0]
+                n, m = abs(s), min(abs(s), 10)
+                cut += n > 10
+                self.assertEqual(struct.unpack_from("<i", b, i)[0], m if s >= 0 else -m)
+                self.assertEqual(a[i + 4:i + 12], b[i + 4:i + 12])
+                self.assertEqual(a[i + 12 + 8 * (n - m):i + 12 + 8 * n], b[i + 12:i + 12 + 8 * m])
+                self.assertEqual(b[i + 12 + 8 * m:i + 12 + 120], bytes(8 * (15 - m)))
+                i, numbers = i + 12 + 120, numbers + 1
+        self.assertEqual(i, len(a))
+        self.assertGreater(cut, numbers // 2)      # most numbers had more than 10 limbs: the cut is exercised
 
     def test_real_checkpoint(self):
         """A rank file of a real 384-bit generation (tests/fixtures/checkpoint-384: Ising Lambda 11 at

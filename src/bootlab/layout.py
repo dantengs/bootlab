@@ -68,9 +68,9 @@ def rank_node(rank: int, ppn: int) -> int:
 
 
 def problem_key(problem) -> tuple:
-    """What a bench solver row must name to stand for this run: the model's name and Lambda. A row without
-    them (older rows) stands for no run."""
-    return problem.model["name"], problem.numerics["lambda"]
+    """What a bench solver row must name to stand for this run: the model's name (Problem.model_name: a built-in
+    model's card its bound) and Lambda. A row without them (older rows) stands for no run."""
+    return problem.model_name, problem.numerics["lambda"]
 
 
 def solver_times(bench: dict, key: tuple, ppn: int, transport: str = "ib") -> dict:

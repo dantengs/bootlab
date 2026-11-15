@@ -34,6 +34,7 @@ STALLED = {"maxComplementarity exceeded", "primal step too small", "dual step to
 
 
 RANK_ENV = Path(__file__).resolve().parent / "rank_env.sh"
+NODE_MPIRUN = Path(__file__).resolve().parent / "node_mpirun.sh"
 
 
 def now() -> str:
@@ -71,6 +72,9 @@ class Site:
     launcher: str = None                             # slurm | local; None: site_launcher decides
     mem_gb: int = None                               # local: the memory bootlab may use at most (else MemAvailable)
     memory_guard: str = None                         # local: rss (the default) | systemd (a scope per pmp2sdp instance)
+    # Generators of built-in models by name (site.toml [generators.<name>]): program, the pmp2sdp and sdpb of
+    # the PMP format it writes, and its environment (docs/en/interfaces.md, section 19).
+    generators: dict = field(default_factory=dict)
 
     @property
     def transfer(self) -> str:
@@ -428,6 +432,18 @@ def srun_argv(site: Site, argv: list, ntasks: int, cpus: int, mem_mb: int, mpi: 
     hosts: the step's nodes by name, ntasks and mem_mb then per node (Node.solo, Node.spread); None: one node,
     the step's command as in a job of one node."""
     where = ["--nodes=1"] if hosts is None else [f"--nodes={len(hosts)}", "-w", ",".join(hosts)]
+    if mpi and container and cpus == 1 and (not hosts or len(hosts) == 1) \
+            and getattr(site, "mpi", {}).get("one_node", "mpirun") == "mpirun":
+        # One node: one task, one container, the image's mpirun (node_mpirun.sh), shared memory only. srun
+        # --mpi=pmix with UCX took 21 s to start 256 ranks and 8.7 s to end them, this 0.4 s and 0.1 s
+        # (measured on the development cluster). [mpi] one_node = "srun" keeps a rank a task.
+        cmd = ["srun", "--exact", *where, "--ntasks=1", f"--cpus-per-task={ntasks}", f"--mem={mem_mb}M",
+               "--immediate=10", "--hint=nomultithread", "--cpu-bind=cores", "bash", str(NODE_MPIRUN),
+               "apptainer", "exec"]
+        for b in site.binds:
+            cmd += ["--bind", b]
+        return cmd + [site.sif, "mpirun", "-np", str(ntasks), "--map-by", "core", "--bind-to", "core"] + \
+            [str(a) for a in argv]
     tasks = [f"--ntasks={ntasks}"] if not hosts or len(hosts) == 1 else \
         [f"--ntasks={ntasks * len(hosts)}", f"--ntasks-per-node={ntasks}"]
     cmd = ["srun", "--exact", *where, *tasks, f"--cpus-per-task={cpus}", f"--mem={mem_mb}M",
@@ -611,8 +627,9 @@ def node_used_mb() -> float:
 
 
 def build_sdps(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: int, log_dir: Path, instances: int,
-               procs: int):
-    """pmp2sdp for each named PMP (its pmp.nsv), `instances` at a time with `procs` processes each, each step
+               procs: int, program: str = None):
+    """pmp2sdp (site.pmp2sdp, or program: a built-in model's generator names its own, interfaces section 19) for each
+    named PMP (its pmp.nsv), `instances` at a time with `procs` processes each, each step
     with --mem = (node memory - driver reserve) / instances.
 
     While a wave runs, the steps' cgroups are read every SAMPLE_SECONDS. Returns (name -> SDP directory,
@@ -624,7 +641,7 @@ def build_sdps(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: in
     Where the steps' cgroups cannot be read (cgroup v1, another layout: an external boundary) there is no
     watchdog: the wave's "watchdog" is false and held_mb is node_mb, the node's MemTotal - MemAvailable rise."""
     if node.launcher == "local":
-        return build_sdps_local(site, node, pmps, sdp_root, precision, log_dir, instances, procs)
+        return build_sdps_local(site, node, pmps, sdp_root, precision, log_dir, instances, procs, program)
     mem = (node.mem_mb - site.driver_reserve_mb) // instances
     try:
         job = job_cgroup()
@@ -639,7 +656,7 @@ def build_sdps(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: in
         running = {}
         for name in batch:
             sdps[name] = sdp_root / name
-            argv = [site.pmp2sdp, "--precision", precision, "--input", pmps[name], "--output", sdps[name]]
+            argv = [program or site.pmp2sdp, "--precision", precision, "--input", pmps[name], "--output", sdps[name]]
             running[name] = start(srun_argv(site, argv, procs, 1, mem, mpi=True, hosts=node.solo()),
                                   log_dir / f"pmp2sdp-{name}")
         wave = {"names": batch, "held_mb": 0.0, "cgroup_peak_mb": 0.0, "node_mb": 0.0}
@@ -676,6 +693,60 @@ class StepFailed(Exception):
     """A program of the step failed: the step ends as aborted, failed."""
 
 
+class Stalled(StepFailed):
+    """A program that stopped writing anything (wait_watched): the run ends as unfinished, its checkpoint intact, a
+    resume starts the step again (as after maxRuntime or SIGTERM)."""
+
+
+STALL_POLL_SECONDS = 30
+STALL_GRACE_SECONDS = 60
+
+
+def last_change(paths: list) -> float:
+    """The latest modification time among these paths: files themselves, directories with every directory
+    below them (a file made or renamed in a directory changes the directory's time; files are not read)."""
+    t = 0.0
+    for p in map(Path, paths):
+        if not p.exists():
+            continue
+        t = max(t, p.stat().st_mtime)
+        if p.is_dir():
+            for d, subdirs, _ in os.walk(p):
+                for s in subdirs:
+                    try:
+                        t = max(t, os.stat(os.path.join(d, s)).st_mtime)
+                    except FileNotFoundError:     # removed while walked
+                        pass
+    return t
+
+
+def wait_watched(proc: subprocess.Popen, watch: list, stall_s: float, what: str, log: Path,
+                 poll: float = None) -> int:
+    """proc's exit code, or Stalled when none of `watch` (its logs, its output directories) has changed for
+    stall_s seconds: the program is ended (SIGTERM, then SIGKILL after STALL_GRACE_SECONDS; for srun that ends
+    the step) and the error gives the last lines of its log.err. A program that hangs without a word (the
+    generator in its parts stage once: 1 h 48 min until the job's time limit) ends the run as unfinished
+    instead of holding the node (an abnormal result ends the run; no retry)."""
+    start = time.time()
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return code
+        quiet = time.time() - max(last_change(watch), start)
+        if quiet > stall_s:
+            proc.terminate()
+            try:
+                proc.wait(STALL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            err = log.with_suffix(".err")
+            tail = [l.strip()[:200] for l in err.read_text(errors="replace").splitlines() if l.strip()][-5:]                 if err.exists() else []
+            raise Stalled(f"{what} stalled after {quiet:.0f} s without output (limit {stall_s:.0f} s); "
+                          f"its last lines: {' | '.join(tail) or 'none'}")
+        time.sleep(poll or STALL_POLL_SECONDS)
+
+
 def flag(v) -> str:
     """A run.toml value as a command-line value. Floats never get here: load rejects them."""
     if isinstance(v, bool):
@@ -684,13 +755,14 @@ def flag(v) -> str:
 
 
 def run_dynamical_sdp(site: Site, node: Node, procs: int, center: Path, neighbors: list, out_dir: Path,
-                      ck_dir: Path, solver: dict, dynamical: dict, state: dict, log: Path) -> int:
-    """One dynamical_sdp call. solver: SDPB options by flag name; dynamical: dynamical_sdp's own options;
+                      ck_dir: Path, solver: dict, dynamical: dict, state: dict, log: Path, program: str = None) -> int:
+    """One dynamical_sdp call (site.dynamical_sdp, or program: a built-in model's generator may name its own).
+    solver: SDPB options by flag name; dynamical: dynamical_sdp's own options;
     state: total_iterations, prev_step, prev_gradient, prev_hessian (flattened), hessian_guess (flattened),
     gap_upper_limit, boundary_direction, box_min, box_max."""
     nsv = out_dir.parent / "new_sdp_dirs.nsv"
     nsv.write_text("".join(f"{p}\0" for p in neighbors))
-    argv = [site.dynamical_sdp, "--sdpDir", center, "--newSdpDirs", nsv, "--outDir", out_dir,
+    argv = [program or site.dynamical_sdp, "--sdpDir", center, "--newSdpDirs", nsv, "--outDir", out_dir,
             "--checkpointDir", ck_dir]
     for k, v in solver.items():
         argv += [f"--{k}", flag(v)]
@@ -891,7 +963,7 @@ def scope_memory(d: Path):
 
 
 def build_sdps_local(site: Site, node: Node, pmps: dict, sdp_root: Path, precision: int, log_dir: Path,
-                     instances: int, procs: int):
+                     instances: int, procs: int, program: str = None):
     """build_sdps on a machine without Slurm: the instances of a wave on disjoint physical cores; the
     watchdog reads each instance's process tree (tree_memory_mb) or, with memory_guard = systemd, its scope's
     cgroup; over MEMORY_WATCH of its share the wave's trees are ended and the step fails. The waves as
@@ -906,7 +978,7 @@ def build_sdps_local(site: Site, node: Node, pmps: dict, sdp_root: Path, precisi
         running, units = {}, {}
         for j, name in enumerate(batch):
             sdps[name] = sdp_root / name
-            argv = [site.pmp2sdp, "--precision", precision, "--input", pmps[name], "--output", sdps[name]]
+            argv = [program or site.pmp2sdp, "--precision", precision, "--input", pmps[name], "--output", sdps[name]]
             wrap = None
             if scoped:
                 units[name] = f"bootlab-pmp2sdp-{os.getpid()}-{i + j}.scope"
@@ -1022,6 +1094,15 @@ def group_alive(pgid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def run_sdpb(site: Site, node: Node, program: str, procs: int, sdp: Path, out_dir: Path, ck_dir: Path,
+             args: list, log: Path) -> int:
+    """One sdpb call on the whole node: args are its options (sdpb-haskell getParamArgs' order), then the
+    directories, as sdpb-haskell's getInputArgs puts them."""
+    argv = [program, *args, "--sdpDir", sdp, "--outDir", out_dir, "--checkpointDir", ck_dir]
+    mem = node.mem_mb - site.driver_reserve_mb
+    return launch(site, node, argv, procs, 1, mem, True, log, hosts=node.solo()).wait()
 
 
 def sdp_size(sdp: Path):
@@ -1381,15 +1462,17 @@ def kept_for(ck: Path, records: int):
     return d / str(max(ks)) if ks else None
 
 
-def prune_kept(ck: Path, records: int):
-    """After record `records` is written: the kept/<k> older than kept_for's removed, so one is left (each
-    holds a whole generation once the solver has saved over it). Not when kept/<k> is made: a job killed
-    between that and record k resumes with k - 1 records, and needs kept/<k - 1>; so two for that while."""
-    last = kept_for(ck, records)
-    if last:
-        for p in (ck / "kept").iterdir():
-            if p.name.isdigit() and int(p.name) < int(last.name):
-                shutil.rmtree(p)
+def prune_kept(ck: Path, records: int, keep: int):
+    """After record `records` is written: of the kept/<k> with k <= records, the newest `keep` left ([skydive]
+    keep_checkpoints, inputs.KEEP_CHECKPOINTS by default), the older removed (each holds a whole generation once
+    the solver has saved over it). A resume loads the newest (kept_for); the others are copies to go back to by
+    hand. Not when kept/<k> is made: a job killed between that and record k resumes with k - 1 records, and
+    needs kept/<k - 1>; so one more for that while. The data held: at most keep + 2 generations (the solver's
+    current and backup besides)."""
+    d = ck / "kept"
+    ks = sorted(int(p.name) for p in d.iterdir() if p.name.isdigit() and int(p.name) <= records) if d.exists() else []
+    for k in ks[:-keep]:
+        shutil.rmtree(d / str(k))
 
 
 def restore_generation(ck: Path, kept: Path) -> int:

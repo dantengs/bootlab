@@ -147,6 +147,20 @@ class Bench(unittest.TestCase):
         self.assertEqual(bench.solver_procs(b, 128, 608, 151)[0], 96)     # the L=11 model: 128 not measured there
         self.assertEqual(bench.solver_procs({"solver": []}, 256, 854, 88)[0], 256)
 
+    def test_same_sdpb_version_first(self):
+        """The nearest problem among the program's SDPB version; all rows when that version has none."""
+        def row(problem, n, blocks, program, procs, s):
+            return {"problem": problem, "N": n, "blocks": blocks, "program": program, "nodes": 1,
+                    "procs_per_node": procs, "s_per_iter": s, "source": "test"}
+        b = {"solver": [row("big", 2261, 223, "dynamical_sdp RV1B 3.0sky", 256, 20.5),
+                        row("big", 2261, 223, "dynamical_sdp RV1B 3.0sky", 128, 30.0),
+                        row("small", 116, 61, "sdpb 3.1.0", 128, 0.29), row("small", 116, 61, "sdpb 3.1.0", 256, 0.35)]}
+        self.assertEqual(bench.solver_procs(b, 256, 274, 46)[0], 128)                               # nearest of all
+        self.assertEqual(bench.solver_procs(b, 256, 274, 46, "dynamical_sdp_RV1B_3.0sky")[0], 256)
+        self.assertEqual(bench.solver_procs(b, 256, 274, 46, "sdpb_3.1.0")[0], 128)
+        self.assertEqual(bench.solver_procs(b, 256, 274, 46, "sdpb_3.0sky")[0], 256)                # same version
+        self.assertEqual(bench.solver_procs(b, 256, 274, 46, "sdpb_9.9")[0], 128)                   # none: all rows
+
     # Node memory as Node.here() reads it, less site.toml's driver_reserve_mb.
     MEM = {"amd1": 253099 - 4096, "amd2": 376000 - 4096}
 

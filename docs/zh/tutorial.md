@@ -11,7 +11,7 @@
 
 - Slurm ≥ 21.08、Apptainer ≥ 1.1（见 README 的[环境要求](../../README.zh-CN.md#环境要求)）。
 - bootlab 执行层镜像 `bootlab-exec-<版本>-r5.sif`（或更新的版本）及其 sha256。bootlab 运行的所有程序（PMP 生成器、`scalar_blocks`、
-  `pmp2sdp`、`dynamical_sdp`、Open MPI、UCX）和驱动用的 Python 3.12 都在镜像里。镜像暂不随仓库发布。
+  `pmp2sdp`、`dynamical_sdp`、Open MPI、UCX）和驱动用的 Python 3.12 都在镜像里。获取方法见[获取镜像](../../README.zh-CN.md#获取镜像)。
 - 一个所有计算节点都能看到的共享文件系统上的目录（放安装目录和运行目录）。
 
 ## 1. 安装
@@ -34,11 +34,17 @@ image /shared/images/bootlab-exec-r5.sif: sha256 checked
 python: 2259 files from the image checked; 3.12.15
 wrote /shared/<you>/bootlab/bootlab.toml
 wrote /shared/<you>/bootlab/bin/bootlab
-......................................................................
 ----------------------------------------------------------------------
-Ran 159 tests in 6.0s
+Ran 18 tests in 0.2s
 
 OK
+installation checked: modules import, bin/bootlab starts, quick tests pass
+......................................................................
+----------------------------------------------------------------------
+Ran 216 tests in 15.0s
+
+OK
+selftest: every unit test passed
 ```
 
 1. 核对镜像的 sha256（给了 `--sha256` 时）；
@@ -46,10 +52,14 @@ OK
    主机上运行镜像里的 Python 3.12，不设 `LD_LIBRARY_PATH`、`PYTHONHOME`，所以它启动的程序（`srun`、`sbatch`）看到的环境是干净的；
 3. 写 `bootlab.toml`（安装配置，键的说明见 `bootlab.example.toml`），已存在就不动；
 4. 写 `bin/bootlab`，以后都用这个命令，已存在就不动；
-5. 用这个 Python 跑单元测试。
+5. 快速自检安装：所有模块都能导入、`bin/bootlab` 能启动、两个最快的单测（`tests/test_install.py`、`tests/test_regress.py`）通过；
+   这一步失败就停下；
+6. 跑 `bin/bootlab selftest`，即全部单元测试。这一步失败只告警（`install.sh: warning: bin/bootlab selftest failed`）：
+   安装已经完成，这些测试大多与安装无关。
 
 Apptainer 自己可能打印几行 `INFO:`，无关紧要。`apptainer` 不在 `PATH` 上时，`install.sh` 会说明原因并停下。已有 `python/` 时它也停下：
-它从不覆盖（要重新安装，先把旧的挪开）。测试的个数会随代码增加，要看的是最后的 `OK`。
+它从不覆盖（要重新安装，先把旧的挪开）。测试的个数会随代码增加，要看的是 `installation checked`，
+全部单测则看最后的 `OK`。以后随时可以用 `bin/bootlab selftest` 重跑。
 
 此后一律用 `bin/bootlab <命令>`；在任何目录下都能用，从别处建符号链接指向它也行。
 
@@ -188,10 +198,10 @@ echo 'site = "mysite"' >> bootlab.toml
 bin/bootlab regress                    # 或：bin/bootlab regress --node node03 --time 01:00:00
 ```
 
-它把回归输入（Ising 例子，Λ = 11，三步）写到 `runs/regress-input-<时间>/`，交一个整机作业，打印输入目录和 `sbatch` 命令：
+它把回归输入（Ising 例子，Λ = 11，三步）写到 `runs/regress-input-<时间>-<进程号>/`，交一个整机作业，打印输入目录和 `sbatch` 命令：
 
 ```
-# inputs /shared/<you>/bootlab/runs/regress-input-20261113-202539
+# inputs /shared/<you>/bootlab/runs/regress-input-20261113-202539-41872
 # the nodes named in run.toml: node03
 sbatch --job-name=bootlab --exclusive --hint=nomultithread --mem=0 --time=01:00:00 ... --wrap ...
 Submitted batch job 81250

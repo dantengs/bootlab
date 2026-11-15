@@ -37,6 +37,10 @@ class InstallSh(unittest.TestCase):
         shutil.copytree(ROOT / "src" / "bootlab", self.root / "src" / "bootlab",
                         ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "tests" / "reference" / "ising-l11", self.root / "tests" / "reference" / "ising-l11")
+        for f in ("test_install.py", "test_regress.py"):          # the installation's quick tests
+            shutil.copy(ROOT / "tests" / f, self.root / "tests" / f)
+        shutil.copytree(ROOT / "tests" / "fixtures", self.root / "tests" / "fixtures")
+        shutil.copytree(ROOT / "examples" / "ising", self.root / "examples" / "ising")
         hp = self.tmp / "hostpython"
         (hp / "bin").mkdir(parents=True)
         # the stand-in for the image's wrapper keeps the environment it was started with (bin/bootlab's)
@@ -68,9 +72,26 @@ class InstallSh(unittest.TestCase):
         toml = (self.root / "bootlab.toml").read_text()
         self.assertIn('site = "mysite"', toml)
         self.assertIn(f'image = "{self.image}"', toml)
-        self.assertIn("Ran 1 test", r.stderr)
+        self.assertIn("installation checked", r.stdout)
+        self.assertIn("selftest: every unit test passed", r.stdout)
         self.assertTrue(os.access(self.root / "bin" / "bootlab", os.X_OK))
         self.assertIn(f"wrote {self.root}/bin/bootlab", r.stdout)
+
+    def test_selftest_warns_only(self):
+        """A failing unit test outside the quick ones: a warning, the installation in place; a quick one: a stop."""
+        fail = "import unittest\nclass T(unittest.TestCase):\n    def test(self):\n        self.fail('no')\n"
+        (self.root / "tests" / "test_one.py").write_text(fail)
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("installation checked", r.stdout)
+        self.assertIn("warning: bin/bootlab selftest failed", r.stderr)
+        self.assertNotEqual(subprocess.run([str(self.root / "bin" / "bootlab"), "selftest"], env=self.env,
+                                           capture_output=True).returncode, 0)
+        (self.root / "tests" / "test_regress.py").write_text(fail)
+        shutil.rmtree(self.root / "python")
+        r = self.install()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("quick tests failed", r.stderr)
 
     def test_bin_bootlab(self):
         """bin/bootlab from elsewhere (a link, another current directory), no PYTHONPATH: the regression's check

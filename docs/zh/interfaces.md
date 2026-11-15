@@ -43,7 +43,7 @@
 | # | 数据 | 由谁产生 | 放在哪里 | 何时删除 |
 |---|---|---|---|---|
 | 1 | 生成器输入 `request.json` | `pmp.write_request` | `<scratch>/<运行 id>/step_<n>/request.json` | 随这一步删除 |
-| 2 | block 表（block 的有理逼近，每个自旋一个文件） | scalar_blocks，由生成器内部调用 | `<scratch>/<运行 id>/blocks/`，整个运行的各步共用 | 运行结束时 |
+| 2 | block 表（block 的有理逼近，每个自旋一个文件） | scalar_blocks，由生成器内部调用 | `<scratch>/<运行 id>/blocks/p<位数>/`（每种精度一个目录），整个运行的各步共用 | 每次生成器调用之后（Skydive，`skydive.Run.prune_blocks`）：删掉最近两次调用都没建的，Δ12 = Δ34 = 0 的（每个点都一样）除外，driver.log 记留下和删掉的大小；其余运行结束时删 |
 | 3 | PMP：本步各点共用的 JSON 部件，每个点一份清单 | 生成器 | `step_<n>/pmp/json/`、`step_<n>/pmp/<点名>/pmp.nsv` | 这一步做完后；终点的拷到 `endpoint/` |
 | 4 | SDP（`block_info_*.json`、`block_data_*.bin`） | `pmp2sdp` | `step_<n>/sdp/<点名>/` | 这一步做完后 |
 | 5 | 求解输出与检查点 | `dynamical_sdp` | `step_<n>/out/`；检查点在 `<运行目录>/checkpoint/` | out 的小文件拷到 `<运行目录>/steps/<n>/`；检查点留着（第 11 节） |
@@ -189,7 +189,12 @@ gap_upper_limit = "1e-12"                  # 必须写
 # infinitesimal = "1e-20"                  # >= 1e-25
 # block_timings = "/绝对路径/checkpoint/block_timings"   # 新运行：用另一次运行的块耗时，不做 timing run
 # mixed_precision = false                  # true：见 10.1 节
+# precision_return_after = 3               # 10.1：降回前要连续几次健康的全精度调用（未测的初值）
+# precision_return_limit = 2               # 10.1：一个运行最多降回几次（未测的初值）
+# precision_return_margin = 10             # 10.1：降回时在 30 位之外再要求的位数（未测的初值）
 # large_steps = false                      # true：见 10.2 节
+# keep_checkpoints = 2                     # 每条记录后留下的检查点代数（第 11 节）
+# large_steps_sign_cooldown = 3            # 不写：N 变号后不再走大步（10.2 节）
 
 [solver]                                   # SDPB 选项，键是参数名，覆盖 skydive.solver_defaults(nmax)
 [dynamical]                                # dynamical_sdp 自己的选项，覆盖 skydive.DYNAMICAL_DEFAULTS
@@ -217,7 +222,7 @@ gap_upper_limit = "1e-12"                  # 必须写
 | `skydive.py` | Skydive 循环、记录、结局；求解器默认值 | `Run.loop`、`Run.step`、`gap_threshold`、`tracked_gap_limit`、`optimal_ending`、`solver_defaults`、`start_state`、`resume_state` |
 | `execute.py` | 站点和安装；`srun` 步；带内存看门狗的 `pmp2sdp` 波次；`dynamical_sdp`；读输出；选 scratch；节点间拷贝；检查点的代 | `load_site`、`srun_argv`、`build_sdps`、`run_dynamical_sdp`、`read_dive`、`classify`、`choose_scratch`、`distribute`、`keep_generation`、`restore_generation` |
 | `layout.py` | 按站点和 bench 给运行选节点；核对分配 | `choose_nodes`、`resume_plan`、`check_allocation`、`permitted` |
-| `bench.py` | bench 文件；求解器进程数；`pmp2sdp` 的进程数和实例数 | `load_bench`、`solver_procs`、`grid_ok`、`pmp2sdp_procs`、`pmp2sdp_at_once` |
+| `bench.py` | bench 文件；求解器进程数；`pmp2sdp` 的进程数和实例数 | `load_bench`、`solver_procs`、`grid_ok`、`pmp2sdp_procs`、`pmp2sdp_at_once`、`sdp_build_row` |
 | `cli.py` | `run`、`resume`、`submit`、`summary`、`regress`、`probe`、`site` | `main` |
 | `probe.py` | 集群探测 | 子命令 `plan`、`node`、`pair`、`merge` |
 | `sitegen.py` | 由探测生成站点；站点对比 | `generate`、`choose_scratch`、`multinode` |
@@ -266,6 +271,11 @@ scalar_blocks 脚本）。
 
 ## 8. 执行层：一次 dive
 
+在这之前，本步的 PMP 由一次生成器调用写出，有看门狗：这次调用的日志、输出目录和块目录都超过一定时间没有变化，就结束调用，运行以
+`unfinished: generator stalled after N s without output …` 结束，写出时限的来源和 `generator.err` 的最后几行（曾有生成器在部件
+阶段无声挂住）；检查点完好，续算从这一步重新开始，和 maxRuntime 之后一样。时限是本运行第一次生成器调用用时的 5 倍，不少于 10 分钟；
+还没有计时时为 1 小时，driver.log 写明所用的值。
+
 1. `k+1` 个 `pmp2sdp` 实例（`pmp2sdp --precision <p> --input <pmp.nsv> --output <sdp 目录>`），分波次运行（第 9 节）。
 2. 一个 `dynamical_sdp`，用节点（或多台节点）的全部物理核（或 bench 选出的进程数）；参数是 `--sdpDir` 中心 SDP、`--newSdpDirs` 邻点的 SDP、
    `--checkpointDir <运行目录>/checkpoint`，从上一次求解热启动（第一次冷启动），再加上本步的选项（间隙上限和阈值、BFGS 状态：梯度、Δx、
@@ -302,7 +312,7 @@ class Dive:
 | 环节 | 并行方式 | bootlab 怎么选 |
 |---|---|---|
 | `dynamical_sdp` | MPI，每步一次 | 这个型号单节点的 bench 记录里，取规模最接近的问题（距离 \|ln(N/Nᵢ)\| + \|ln(块数/块数ᵢ)\|）最快的进程数，只在网格不退化的进程数里选；没有记录就用全部物理核。整个运行不变（热启动链要求） |
-| `pmp2sdp` | MPI，扩展性差 | 每个实例 p = min(31, ⌊核数 ÷ 点数⌋) 个进程。第一步只转中心点，从这个 srun 步的 cgroup 每 0.2 s 读一次 memory.current − file + shmem，取峰值 P；之后 k = ⌊(节点内存 − driver_reserve) ÷ (1.15 P)⌋ 个实例同时跑。每个步的 `--mem` = 节点内存 ÷ 实例数。**看门狗**：一波里任何一个步占用超过它 `--mem` 的 95%，就撤掉整波（内存不够时 pmp2sdp 不报错而是停住），这一步以失败结束。没有 cgroup v2 时看门狗关掉，内存改用节点 MemTotal − MemAvailable |
+| `pmp2sdp` | MPI，扩展性差 | 每个实例 p = min(31, ⌊核数 ÷ 点数⌋) 个进程。第一步（bench 里没有 `bootlab bench` 写的对应 `sdp_build` 行给出 P 时）只转中心点，从这个 srun 步的 cgroup 每 0.2 s 读一次 memory.current − file + shmem，取峰值 P；之后 k = ⌊(节点内存 − driver_reserve) ÷ (1.15 P)⌋ 个实例同时跑。每个步的 `--mem` = 节点内存 ÷ 实例数。**看门狗**：一波里任何一个步占用超过它 `--mem` 的 95%，就撤掉整波（内存不够时 pmp2sdp 不报错而是停住），这一步以失败结束。没有 cgroup v2 时看门狗关掉，内存改用节点 MemTotal − MemAvailable |
 | block 表 | 生成器内部，scalar_blocks 多线程 | k = min(表数, 核数 ÷ 4) 张表同时算，每张 核数 ÷ k 个线程 |
 
 **网格不退化**：Elemental 的默认进程网格从 ⌊√p⌋ 往上找第一个能整除 p 的数作为行数；p = 127 得到 127 × 1（慢），128 得到 16 × 8。
@@ -315,13 +325,18 @@ class Dive:
 | 列表 | 记录的主要字段 | 谁读 |
 |---|---|---|
 | `solver` | `problem`、`model`、`lambda`、`N`、`blocks`、`precision`、`program`、`nodes`、`procs_per_node`、`s_per_iter`、`max_memused_gb`、`transport`（多节点；默认 `ib`）、`source` | `bench.solver_procs`、`layout.choose_nodes` |
-| `sdp_build`、`blocks`、`generator`、`copy`、`rdma`、`pmp_size`、`nfs` | 各环节的实测 | 给人看；代码只读 `solver` |
+| `sdp_build` | `problem`、`model`、`lambda`、`N`、`blocks`、`precision`、`program`、`instances`、`procs`、`sdps`、`wall`、`per_sdp`、`peak_gb_per_instance`、`held_mb`（`bootlab bench` 写的行才有）、`cgroup_peak_mb`、`source` | `bench.sdp_build_row`（只认有 `held_mb` 的行）：Skydive 循环里 `pmp2sdp` 的内存（第 10 节） |
+| `generator` | `problem`、`model`、`lambda`、`precision`、`points`、`cores`、`program`、`wall`、`node_gb`、`source`（`bootlab bench` 写的行；较早的行是整步的实测） | 给人看 |
+| `blocks`、`copy`、`rdma`、`pmp_size`、`nfs` | 各环节的实测 | 给人看 |
 
-没有 bench 文件就意味着：全部物理核、单节点、第一步实测 `pmp2sdp`。
+没有 bench 文件就意味着：全部物理核、单节点、第一步实测 `pmp2sdp`。某一步在本节点型号的 bench 文件里找到 `bootlab bench` 写的、模型、Λ、
+精度和 `pmp2sdp` 进程数都相同的 `sdp_build` 行时，就按这一行的 `held_mb` 定 k，不再先单独转中心点的 SDP 来测。
 
 **`bootlab bench <run.toml> [--node H] [--time] [--dry]`**（`benchrun.py`）：经 `submit` 交一个整机作业（作业里运行 `bench run <run.toml>`；
-单机模式下在后台运行）。生成器只写运行起点这一个点的 PMP，一个 `pmp2sdp` 转成 SDP，`sdpb_3.0sky` 在全部物理核和一半物理核上各跑
-`--maxIterations 12`（只取过得了 `grid_ok` 的进程数）。每次迭代的秒数 = 迭代表的 (t₁₂ − t₄) / 8（整秒）。每个进程数写一行 `solver`（`model`、
+单机模式下在后台运行）。在运行开始时会用的每个精度下（问题自己的；开了 `mixed_precision` 时再加梯级在 `gap_upper_limit` 处的选择，见 10.1），
+生成器在全部物理核上只写运行起点这一个点的 PMP（写一行 `generator`：用时，`node_gb` 是节点 MemTotal − MemAvailable 的升幅），一个 `pmp2sdp`
+按运行给每个实例的进程数（按运行的点数取 `pmp2sdp_procs`）转成 SDP（写一行 `sdp_build`：用时，以及与运行中一步相同口径的占用内存）。然后
+`sdpb_3.0sky` 以全精度在全部物理核和一半物理核上各跑 `--maxIterations 12`（只取过得了 `grid_ok` 的进程数）。每次迭代的秒数 = 迭代表的 (t₁₂ − t₄) / 8（整秒）。每个进程数写一行 `solver`（`model`、
 `lambda`、`N`、`blocks`、`precision`、`program`、`nodes` = 1、`procs_per_node`、`s_per_iter`、`source` = 日期和机器的插槽数、CPU 型号、物理核数、
 内存），追加到 `<站点的 bench>/<节点型号>.json`。
 
@@ -353,7 +368,7 @@ class Dive:
 
 默认关；`bin/bootlab regress` 用全精度。求解器和 `pmp2sdp` 用 {384, 512, 768, 1024} 中低于问题 `solver_precision` 的、满足
 `0.30103·P − 95 − 0.6·log10(1/间隙) ≥ 30` 位的最小精度 P（间隙取上一条记录的，开始时取 `gap_upper_limit`），都不满足就用全精度。
-只升不降。依据（实测）：`infinitesimal` 为 1e-40 时 Λ = 23、27 分别丢 78、83 位，那里 384–512 位时整步快 2.3–2.6 倍；
+按下面的规则升到全精度，也会再降回来。依据（实测）：`infinitesimal` 为 1e-40 时 Λ = 23、27 分别丢 78、83 位，那里 384–512 位时整步快 2.3–2.6 倍；
 1e-20 时 Ising Λ = 11 丢 68 位（384 位与 785 位、与参考程序都一致到 47.5 位）；间隙 6.8e-21 时 384、512 位的步长与
 785 位分别一致到 40.9、80.2 位（按公式折算丢 62 位）；一个较大的问题（N ≈ 2300、约 220 块，全精度 1024 位）在间隙 1.9e-14 时
 512 位与 1024 位一致到 54.6 位（丢 91 位）。损失常数取实测最大的 91 再留余量，定为 95。按这个规则，间隙从 1 到 1e-30 都是 512 位（1e-30 时剩 41 位），
@@ -365,16 +380,33 @@ Ising Λ ≤ 19（全精度 785 位，每步 3 次迭代）只占约五分之一
 在 bootlab 上，较大的问题（N ≈ 2300、约 220 块、全精度 1024 位）第 2–6 步，512 位整步快 1.27 倍：其中迭代快约 1.6 倍，
 生成器加 `pmp2sdp` 每步约 220 s，不随精度变。所以在 bootlab 里整步的收益小于上面研究里的 2.3–2.6 倍（那里生成也降了精度）。
 
-- **健康检查**（低于全精度时；触发后从下一次调用起用全精度）：调用中止；上一次走步的调用 `findMinimumQ` 为假、这次为真（路径离开了允许区；
+- **健康检查**：调用中止；上一次走步的调用 `findMinimumQ` 为假、这次为真（路径离开了允许区；
   反过来由真变假是从区外开始的运行进入允许区，属正常路径）；既没爬升、不是冷启动、
   也不是大步之后（10.2）的调用，迭代数超过 max(4, 最近 5 次这类调用迭代数中位数的 2 倍)。不查 N 的符号。
+- **状态**（`precision.decide`）：每条记录的 `precision_state` 是下一次调用所处的状态，`precision_next` 是那次的精度；
+  状态或精度变了，`precision_note` 写原因；`summary.md` 在"Precision"下列出每次变化。状态全由记录推出，续算不需要别的信息；
+  没有这些状态之前的记录，`precision_next` 低于全精度算 low，否则算 high。
+  - **low**：调用没通过健康检查，进入 **confirm**；如果离上次降回不到 5 次调用，直接 **locked**。
+    当前间隙下全精度以下没有一档能留住 30 位时，**locked**。
+  - **confirm**：同一次调用用全精度原样重做：同一点、同一 BFGS 状态，从上一条记录留下的那一代检查点开始（没有就冷启动，与原来那次一样）。
+    低精度那次的记录保留，日志移到 `steps/<n>-<P>bits/`；低精度调用中止也照此确认。全精度那次同样没通过检查，说明是路径本身的行为、
+    与精度无关：回到 **low**，取梯级的选择，从全精度这次的步和检查点接着算（中止的调用照常结束运行，任何精度都一样）。
+    通过了：**high**。
+  - **high**：全精度。已降回 `precision_return_limit` 次（2），或当前间隙下全精度以下没有一档能留住 30 + `precision_return_margin`（10）位，
+    就 **locked**；连续 `precision_return_after`（3）次全精度调用通过检查（确认的那次也算；爬升调用不计数、也不打断）后，降到能留住这么多位的
+    最低一档，回到 **low**。这三个默认值是未测的初值。
+  - **locked**：全精度到底。
 - **结束**：低于全精度的调用以 `optimal` 结束时不下结论；在同一点、用同一 BFGS 状态再用全精度解一次（低精度那次的日志移到
-  `steps/<n>-<P>bits/`），由这一次决定。终点和 EFM 都是全精度。
+  `steps/<n>-<P>bits/`），由这一次决定（**locked**）。终点和 EFM 都是全精度。
 - **检查点**：二进制检查点里每个数的长度由精度决定，文件里不存精度，`dynamical_sdp` 读不了别的精度写的检查点（它的文本检查点要求
-  每次低于全精度的调用都把 X、Y 写成文本）。调用的精度不低于它所用的留下的一代（`layout.json` 的 `precision`；没有就是问题的精度）；
-  要升高时，驱动先把这一代按新精度改写成下一代，limb 补零（`precision.convert_checkpoint`）。所以检查点已是全精度的运行再打开混合精度，
-  仍是全精度。续算从最后一条记录的 `precision_next` 接着。
-- 生成器不变（PMP 是十进制文本）；精度升高时重新测一次 `pmp2sdp` 的内存。
+  每次低于全精度的调用都把 X、Y 写成文本）。调用的精度与它所用的那一代（`layout.json` 的 `precision`；没有就是问题的精度）不同时，
+  驱动先把这一代按调用的精度改写成下一代（`precision.convert_checkpoint`）：升高时 limb 补零，数值不变；降低时每个数只留最高的那些 limb，
+  与 GMP 浮点数自身的截断方式相同（512 位时相对误差 2^-576，远小于调用能留住的位数）。检查点已是全精度的运行再打开混合精度，
+  从梯级的选择开始。续算从最后一条记录的 `precision_next` 接着；最后一条记录处于 confirm 时，从它前一代检查点重做那次调用。
+- 生成器也用这次调用的精度（请求里的 `blockPrecision`，见 `pmp.model_section`：块表和它的算术都用；问题设了 `block_precision` 时不超过它）；
+  全精度时请求与不开混合精度时相同，PMP 是同一个文件。各精度的块表放在各自的目录 `blocks/p<位数>` 下：块表文件名里没有精度，而生成器只在文件不存在时才建表
+  （修正之前，同一点先 512 位、再全精度时，全精度那次读的是 512 位的表）。精度升高时重新测一次 `pmp2sdp`
+  的内存（或取 bench 里的行，见第 9 节）。
 
 ### 10.2 动态大步（`large_steps = true`）
 
@@ -383,8 +415,10 @@ Ising Λ ≤ 19（全精度 785 位，每步 3 次迭代）只占约五分之一
 
 - c = cos(Δx/α, 上一次的 Δx/α)，α = `alpha_d`。冷却中、c ≤ 0.99 或这次爬升了，m = 1；c ≤ 0.999 时 m = 2；否则 m = ⌊0.5/α⌋，
   限在 [1, 8]；x + m·Δx 出了盒子就取 1。
-- 一次 m > 1 的大步之后的那次调用：`findMinimumQ` 变了 → `stopped: findMinimumQ changed after a step m times ahead`；N 变号 → 这次
-  运行不再走大步；迭代超过 3 + 1.5(m − 1)，或 c < 0.98 → 接下来 2 次调用 m = 1。
+- 一次 m > 1 的大步之后的那次调用：`findMinimumQ` 由假变真（路径离开了允许区）→ `stopped: findMinimumQ changed to true after a step m
+  times ahead (left the allowed region)`；由真变假（进入允许区，是从区外开始的运行的正常路径；N 同时变号）→ 接下来 2 次调用 m = 1；
+  除此之外 N 变号 → 这次
+  运行不再走大步（设了 `large_steps_sign_cooldown = k` 时只让接下来 k 次调用 m = 1）；迭代超过 3 + 1.5(m − 1)，或 c < 0.98 → 接下来 2 次调用 m = 1。
 - 传给 BFGS 的步长是 m·Δx；记录里 `ext_step` 仍是求解器给的 Δx，另记 `jump` = m；续算从 x + m·Δx 接着。
 - 与混合精度同时开：大步之后的那次调用按大步自己的迭代预算，不进健康检查。
 - 实测（一个较大的问题，N ≈ 3000、约 270 块；同一起点，各 13 h）：1024 位时推进是不跳的 1.84 倍。每个点仍是求解器收敛到的点：大步走坏了只费
@@ -400,8 +434,10 @@ Ising Λ ≤ 19（全精度 785 位，每步 3 次迭代）只占约五分之一
   `checkpoint_new.json`，再原子地改名为 `checkpoint.json`，只留两代；所以任何时刻被杀，`checkpoint.json` 指的那一代都完整，但它可能是
   一次调用中途的那一代。
 - 所以每次调用结束后、写它的第 k 条记录之前，bootlab 建 `checkpoint/kept/<k>/`：这一代各 rank 文件的硬链接，`checkpoint.json` 和
-  `block_timings` 的拷贝，以及 `layout.json`（`nodes`、`node_type`、`ppn`、`precision`、`generation`）；先在 `kept/<k>.new` 里建好再改名。记录写完后删掉
-  更早的 kept，所以任何时刻至多三代，每条记录写完后两代。
+  `block_timings` 的拷贝，以及 `layout.json`（`nodes`、`node_type`、`ppn`、`precision`、`generation`）；先在 `kept/<k>.new` 里建好再改名。记录写完后，
+  k ≤ 记录数的 kept 只留最新的 `[skydive] keep_checkpoints` 个（不写是 2，至少 1），更早的删掉；续算用最新的一个，其余是留着手动回退用的。
+  所以任何时刻至多 keep + 2 代（另加求解器自己的当前代和备份代），每条记录写完后 min(记录数, keep) + 1 代。混合精度只用到最新的一个：
+  optimal 之后的全精度重解和升精度，都是把最后一条记录留下的那一代转换成新文件（10.1）。
 - **续算**：取 k ≤ 记录数的最大 `kept/<k>`；更新的和没建完的删掉；`checkpoint/` 里只删别的代的 rank 文件；把留下的文件链回来。布局
   （节点数、型号、每节点进程数）变了就冷启动。运行目录所在的文件系统必须能建硬链接：每次 run、resume 开始时试建一个，不行就停。
 
@@ -496,7 +532,7 @@ TCP 用 `tcp,self,sm`）。
 ## 15. 探测与站点生成
 
 `bootlab probe plan`（登录节点）→ `probe node` 作业（每型号一个），可选 `probe pair` 作业 → `probe merge` → `bootlab site gen`。`probe plan --partition P` 只读分区 P（`sinfo -p`），作业交到 P，并在 plan.json 里记下 `partition`；之后
-`site gen` 只放探测过的型号，写 `[slurm] partition = P`（手写文件的 `[slurm]` 优先）。`probe plan --node H` 在 H 上探测，不管它忙不忙。
+`site gen` 只放探测过的型号，写 `[slurm] partition = P`（手写文件的 `[slurm]` 优先），旁注写明来源（`partition from the probe plan` 或 `hand`）。`probe plan --node H` 在 H 上探测，不管它忙不忙。
 
 | 文件 | 内容 |
 |---|---|
@@ -520,12 +556,13 @@ TCP 用 `tcp,self,sm`）。
 
 ## 16. 回归
 
-`bootlab regress [--site] [--node] [--time] [--dry]` 把 `examples/ising`（Λ = 11、三步）写到 `<runs>/regress-input-<时间>/`，交一个整机作业运行
+`bootlab regress [--site] [--node] [--time] [--dry]` 把 `examples/ising`（Λ = 11、三步）写到 `<runs>/regress-input-<时间>-<进程号>/`（同一秒交两次也不重名），交一个整机作业运行
 `regress run`；`regress check <运行目录>` 可以比较任何一个运行目录。参考值是 `tests/reference/ising-l11/bt-steps.json`（参考程序前三步的全精度值）。
 每个数要一致 ≥ 130 位有效数字（用 `decimal` 以 500 位精度计算，只用标准库）；离散量必须相等。运行目录里写 `regress.json`（`passed`、`least`、
 每步的位数、问题）。
 
-单元测试：`python/bin/python3 -m unittest discover -s tests`（不需要集群；站点相关的测试用 `tests/fixtures/sites/` 里的中性夹具）。
+单元测试：`bin/bootlab selftest`（全部单测，等同 `python/bin/python3 -m unittest discover -s tests`；`install.sh` 会跑它，
+失败只告警，安装闸门本身只查各模块能导入、`bin/bootlab` 能启动和两个快的单测 `tests/test_install.py`、`tests/test_regress.py`；不需要集群；站点相关的测试用 `tests/fixtures/sites/` 里的中性夹具）。
 `tests/test_physics.py` 拿参考程序参数检查的录下输出（6 个模型、14 组用例）核对物理层。
 
 ## 17. 扩展 bootlab
@@ -533,7 +570,8 @@ TCP 用 `tcp,self,sm`）。
 - **新算法**（Navigator、可行性……）：在 `skydive.py` 旁边加一个模块，由它产生点、读取结果；复用 `pmp.write_request`/`pmp.generate`（接口一）、
   `execute.build_sdps`，再为它的求解器（`sdpb`、`approx_objective`）写一个执行函数；写自己的记录行；在 `cli.py` 里加子命令。规矩照旧：输入在
   `inputs.load` 里检查，遇到异常结果就结束，资源按 bench 数据选，投入使用前与参考结果对照。
-- **新生成器**（带自旋的算符）：任何能读第 6 节那样的请求、写出第 7 节那样 PMP 的程序，都可以经站点的 `generator` 接进来。
+- **新生成器**（带自旋的算符）：任何能读第 6 节那样的请求、写出第 7 节那样 PMP 的程序，都可以经站点的 `generator` 接进来；自带模型和 PMP
+  格式的生成器按第 19 节放在 `[generators.<名>]` 下。
 - **新站点**：探测后生成（第 15 节），或者复制 `sites/_template`。
 - **新的实测**：按同样的格式往 bench 文件里追加记录，写明来源。
 - 测试：单元测试加在 `tests/` 下；改动数值的地方要跑回归（第 16 节）或同样强度的对照。
@@ -596,3 +634,61 @@ bootlab 可以在一台没有 Slurm 的 Linux 机器（工作站）上运行。�
 
 **还没测过的**：`memory_guard = "systemd"` 和 `submit --systemd`（只有单测覆盖命令的写法），以及真正没有 Slurm 的机器（验收是在一台计算节点上把
 Slurm 藏起来模拟的）。见 README 的已知限制。
+
+<a id="current-bootstrap"></a>
+## 19. 带自旋的算符：内置模型、逐点扫描与 Skydive（current bootstrap）
+
+DSD 处理带自旋外部算符的 Haskell 代码（stress-tensors-3d，`jt-z2-charge-conjugation-invariant` 分支 478a3fd，基于
+hyp-1.3.36）作为第二个 PMP 生成器接进来。物理（三点结构、守恒、Ward 恒等式、交叉方程）原样留在上游的 Haskell 里；可替换的部分仍是数据。
+
+**内置模型。** 这类模型用模型卡 `bootlab-builtin/1`（JSON）代替 `bt-model/2`：`generator`（站点 `[generators.<名>]` 下的名字）、
+`bound`（生成器登记的 Bound，例如 `JJJJ3d`）、`coordinates`（Bound 自带的坐标，⟨JJJJ⟩ 没有）、`channels`（谱可以用的 channel 及其自旋规则）、
+`objectives`（允许的目标种类）、`lambda`（外部 OPE 方向的维数）。加一个上游 Bound = 在生成器的登记表
+（生成器源码的 `StressTensors3d.Bootlab.Pmp` 模块）里加一行，再写一张卡。例子：`examples/jjjj/`。
+
+- 谱：与 3.2 节相同的 `bootlab-spectrum/1`。⟨JJJJ⟩ 的 channel 是宇称扇区 `P+`、`P-`；`delta` 对应上游的 `Fixed`，`above_unitarity` 对应
+  `RelativeUnitarity`。
+- 目标函数：`kind = "feasibility"`（`lambda` 可选）或 `"ope_bound"`（`lambda` 和 `direction = "upper" | "lower"`）。`lambda` 可以引用点参数，
+  例如 `["1", "x"]`；引用到的参数成为坐标。
+- `run.toml`：`[numerics]` 恰好是上游 `SimpleBoundParams` 的五项：`lambda`（nmax = (Λ+1)/2）、`order`、`num_poles`、`max_spin`
+  （自旋 0…max_spin）、`block_precision`。`[scan] points` 是点的列表，每个点按坐标给精确值（字符串，不收浮点数）。`[solver]` 按 flag 名覆盖
+  求解器参数（给值就替换，`true` 加开关，`false` 去掉）。内置模型有 `[scan]` 或 `[skydive]`，二者取一；`bt-model/2` 模型带 `[scan]` 是错误。
+
+**接口一′：生成器输入。** `stress-tensors-3d-exec pmp <request.json>`：Bound 名、截断参数、每个点的谱（自旋已展开）和目标函数（精确的 JSON
+数字）、输出目录、block 目录、核数。每个点的 Bound 由上游程序自己的构造函数建（⟨JJJJ⟩ 是 `JJJJ2025.jjjj3dBound`），所以键、精度、求解器参数都与
+上游相同。所有点一次交给上游的 `buildBounds`，任务图停在 PMP 部件。每个点写 `pmp.nsv`、`sdpb.args.json`（上游会传给 sdpb 的参数）和
+`bound.json`（键）。生成器在宿主机上运行，环境取 `[generators.<名>.env]`；bootlab 把它调度器的内存设为本步的 `--mem`，并声明没有节点本地路径
+（上游会删掉节点本地路径上的所有输出，最终的部件也在内）。
+
+**接口二：PMP 是 SDPB 3.1 格式。** 生成器写 SDPB 3.1 的 JSON（`prefactor`；Bound 设了 `num_poles` 时还有 `reducedPrefactor`，即 3.1 的降采样，
+改写成 3.0 就是另一个 SDP）。所以不做转换：站点的 `[generators.<名>]` 写明它用的 `pmp2sdp` 和 `sdpb`（3.1.0），这两个程序必须在站点的
+镜像里（bootlab-exec 从 r6 起同时带 3.0sky 和 3.1.0）。标量链不变（3.0sky）。
+
+**逐点扫描（scan）。** 每个点求解一次：生成器 → pmp2sdp → sdpb → `solves.jsonl` 一行（点、primal、dual、gap、N、块数、进程数、用时）。
+block 目录在整个运行内共用。求解器参数取生成器写的 `sdpb.args.json`，`maxRuntime` 改为作业剩余时间减 15 分钟，再叠 `[solver]`。失败直接结束；
+`resume` 从第一个没有记录的点接着算。命令不变（`run`、`resume`、`summary`）；scan 只在一个节点上跑，scratch 的选法与 Skydive 相同；求解器进程数
+按第 9 节从 bench 选（没有实测就用全部物理核）。
+
+**Skydive。** 用的是第 10–12 节的同一个循环（记录、检查点、续算、结局都不变；代码是 `builtin.Skydive`，继承 `skydive.Run` 并覆盖几个钩子），只换四处。
+- PMP：中心点和邻点由 `builtin.write_request`、`builtin.generate` 一次建好，SDP 用生成器指定的 `pmp2sdp`。生成器的输出放在运行级目录 `<scratch>/pmp`，步与步之间（scan 是点与点之间）保留，调度器跳过已有的部件，每一步只建与点有关的部件；换节点或换作业续算时从头建。
+- 求解器：站点的 `dynamical_sdp`；`[generators.<名>]` 可写 `dynamical_sdp` 换掉。3.0sky 能读 pmp2sdp 3.1.0 建的 SDP。
+- 求解器参数：以 Bound 自己的（中心点的 `sdpb.args.json`）为底，之上是 `maxRuntime`、`[solver]`、本步的停止阈值。阈值的设定值是 Bound 的，只有生成器给得出，所以下一步的 PMP 先建好、读出参数，再定选项。精度是 Bound 的，即 `block_precision`；每一步都核对生成器写的精度等于调用的精度、其余参数与第一步相同，不一致就以失败结束。
+- 目标函数：dynamical_sdp 在坐标上把 SDP 的目标值 N 取到极小，所以只收 `ope_bound`。上界方向时 dual 等于界取负，Skydive 走到界最大的点。N 的符号不表示允许或排除：`find_boundary_direction`、`stop_on_negative` 是错误，以 optimal 结束记为 `converged: optimum`。
+
+`large_steps` 照用；`mixed_precision` 时生成器也在调用精度上建 Bound（请求的 `precision` 同时决定 block 与求解精度）。坐标是模型卡的 `coordinates`（写进请求的 `coords`），再加谱和目标函数用到的点参数；⟨JJJJ⟩ 只有点参数，例子 `examples/jjjj/skydive.toml` 走 x = 12γ。以后有带外部维数的 Bound，坐标写进卡里，接口不变。
+
+**已验证**（与上游自己对同一 Bound、同样几个点的运行对照）：d = 3 的 ⟨JJJJ⟩，Λ = 11（nmax 6、order 60、20 个极点、自旋 0–40、768 位），
+`ope_bound` 上界、`lambda = ["1", "x"]`，一个 `P+` 自旋 2 的 gap 3.5，12γ = 0、−1、+1 三个点，单节点。63 个 PMP 部件与上游逐字节相同；
+pmp2sdp 3.1.0 建的 SDP 126 个文件里 124 个逐字节相同，另两个（`control.json`、`pmp_info.json`）只差路径；三个点的 dual 一致至少 172.9 位、
+primal 至少 186.6 位（间隙约 9e-31），N = 116、61 个块两边相同（每次验收都如此，最近一次在 bootlab-exec r6 上）。
+
+**已验证（Skydive，r7）**：⟨JJJJ⟩ Λ = 11，坐标 x = 12γ，上界。dynamical_sdp 3.0sky 读 pmp2sdp 3.1.0 的 SDP，解到最优时与 sdpb 3.1.0 一致 31–32 位（两边间隙约 3e-31）；Skydive 的 dN/dx 与 sdpb 3.1.0 在 x ± 1e-10 的中心差分一致 19.5–19.6 位、符号一致；从 x = −0.11 起 60 步以 `converged: optimum` 结束（中间续算一次），终点两侧 ± 1e-6、± 1e-10 的 B 都更小，差分斜率约为 0，差分曲率与 BFGS 的 Hessian 一致 6 位；按上游源码独立复现的循环前 5 步与 bootlab 一致 ≥ 134 位；`large_steps` 从 x = 0.5 起 30 步到达极大点附近（不开大步 30 步只到 0.34）；`mixed_precision` 12 步 512 位，与全精度一致 78–86 位，高于 10.1 节公式的 55–57 位。
+
+**已知行为**：离极大点远、N 是凹的一段，BFGS 不更新 Hessian，外部步只有 Newton 步的 0.5–0.8%，间隙每步只降约 1.5%：⟨JJJJ⟩ 从 x = 0.5 起不开大步，60 步只走到 0.22。开 `large_steps` 能绕过去，30 步就到了极大点附近，所以从远处起跑建议打开（全局默认仍是关，`examples/jjjj/skydive.toml` 打开了）。到了极大点附近，α ≈ 0.78，间隙每步降到约 0.3 倍，几十步就收敛。
+
+**未验证**：`feasibility` 目标；孤立算符；`P-` 扇区的 gap；其他 Λ；其他上游 Bound（都还没登记：TTTT3d 要先给 `[numerics]` 加半整数自旋表）；
+生成器的单机模式（目前只用 srun 启动）；带外部维数的 Bound 的 Skydive（还没有登记这样的 Bound）；内置模型的 Navigator；内置模型 Skydive 的
+多节点。
+
+**求解器进程数**（在 12γ = 0 实测，取物理核的 1/4、1/2 和全部，各解一次；见站点的 bench 文件）：scan 选最快的。在开发用的集群上，
+最大的节点（256 物理核）是用一半的核最快，较小的节点（96、128 核）是用全部核最快。只测了 Λ = 11 的 ⟨JJJJ⟩；bench 先在求解程序同一 SDPB 版本（3.0sky、3.1.0）的记录里按 N 和块数选最接近的已测问题，该版本没有记录才看全部。

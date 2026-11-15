@@ -1,0 +1,9 @@
+format = "bootlab-spectrum/1"
+# <JJJJ> (model.json): channels are the parity sectors P+ and P- of the exchanged operators.
+# As upstream's jjjj_test_nmax6: unitarity everywhere, and the first parity-even spin-2 operator after T at 3.5.
+default_above_unitarity = "0"
+
+[[gap]]
+channel = "P+"
+spins   = [2]
+delta   = "3.5"

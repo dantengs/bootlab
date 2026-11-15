@@ -1,0 +1,6 @@
+format = "bootlab-objective/1"
+# Upper bound on the external T term along lambda = (1, x): with x = 12 gamma, c_B/c_T <= B(x), so
+# C_T/C_T^free >= 1/(2B) in DPTV's normalisation.
+kind      = "ope_bound"
+lambda    = ["1", "x"]
+direction = "upper"

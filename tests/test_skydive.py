@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import tempfile
+import subprocess
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,10 +101,14 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
     later steps convert k at a time without measuring (docs/en/interfaces.md section 9). build_sdps is made up: it returns
     the held peak it is given, and the solver call stops the step."""
 
-    def steps(self, node, held_mb, n_steps=2, sdp_mem=None):
+    def steps(self, node, held_mb, n_steps=2, sdp_mem=None, sdp_build=None, bits=None):
         import dataclasses
         tmp = Path(tempfile.mkdtemp())
         site = dataclasses.replace(execute.load_site("lab", FIXTURES), scratch=str(tmp / "scratch"))
+        if sdp_build is not None:          # a bench file with these sdp_build rows
+            (tmp / "bench").mkdir()
+            (tmp / "bench" / f"{node.node_type}.json").write_text(json.dumps({"sdp_build": sdp_build}))
+            site = dataclasses.replace(site, bench_dir=tmp / "bench")
         run_dir = tmp / "run"
         run_dir.mkdir()
         p = inputs.load(O5_L23)
@@ -110,15 +116,17 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
         r.sdp_mem = sdp_mem
         calls = []
 
-        def generate(site_, node_, request, log):
+        def generate(site_, node_, request, log, stall_s=None):
             out = request.parent
+            calls.append(json.loads(request.read_text())["model"].get("blockPrecision"))
             for point in json.loads(request.read_text())["points"]:
                 d = out / point["name"]
                 d.mkdir()
                 (d / "part.json").write_text("{}")
                 (d / "pmp.nsv").write_text(f"{d / 'part.json'}\0")
 
-        def build_sdps(site_, node_, lists, sdp_root, precision, log_dir, instances, procs):
+        def build_sdps(site_, node_, lists, sdp_root, precision, log_dir, instances, procs, program=None):
+            self.assertEqual(program, site.pmp2sdp)       # a bt-model/2 run: the site's pmp2sdp
             calls.append((len(lists), instances, procs))
             return ({name: sdp_root / name for name in lists},
                     [{"names": list(lists), "held_mb": held_mb, "cgroup_peak_mb": held_mb + 2600, "node_mb": held_mb}])
@@ -136,12 +144,12 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
                 mock.patch.object(skydive.execute, "job_seconds_left", lambda: 10 ** 6):
             for n in range(1, n_steps + 1):
                 with self.assertRaises(Stop):
-                    r.step(n, x, {"gap_threshold": "1e-30", "precision": p.solver_precision()}, 128)
-        return calls, r, (run_dir / "driver.log").read_text()
+                    r.step(n, x, {"gap_threshold": "1e-30", "precision": bits or p.solver_precision()}, 128)
+        return [c for c in calls if isinstance(c, tuple)], r, (run_dir / "driver.log").read_text(),             [c for c in calls if not isinstance(c, tuple)]
 
     def test_l23_amd1(self):
         """the 7-coordinate model at L=23 at 25.2 GiB an instance (16 processes): first step 1 + 7, then 8 at once."""
-        calls, r, log = self.steps(execute.Node("h-1", "amd1", 128, 253099), 25.2 * GIB)
+        calls, r, log, _ = self.steps(execute.Node("h-1", "amd1", 128, 253099), 25.2 * GIB)
         self.assertEqual(calls, [(1, 1, 16), (7, 7, 16), (8, 8, 16)])
         self.assertEqual((r.sdp_mem["k"], r.sdp_mem["measured_at_step"]), (8, 1))
         self.assertIn("to measure its memory", log)
@@ -149,12 +157,12 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
 
     def test_l23_amd2(self):
         """the 7-coordinate model at L=23 at 28.6 GiB an instance: first step 1 + 7, then 8 at once, 31 processes each."""
-        calls, r, _ = self.steps(execute.Node("h-1", "amd2", 256, 376000), 28.6 * GIB)
+        calls, r, _, _ = self.steps(execute.Node("h-1", "amd2", 256, 376000), 28.6 * GIB)
         self.assertEqual(calls, [(1, 1, 31), (7, 7, 31), (8, 8, 31)])
 
     def test_l27_in_rounds(self):
         """the 7-coordinate model at L=27 at 52.3 GiB (16 processes on amd1): k = 4, so 1 + 4 at a time, then 4 at a time."""
-        calls, r, _ = self.steps(execute.Node("h-1", "amd1", 128, 253099), 52.3 * GIB)
+        calls, r, _, _ = self.steps(execute.Node("h-1", "amd1", 128, 253099), 52.3 * GIB)
         self.assertEqual(calls, [(1, 1, 16), (7, 4, 16), (8, 4, 16)])
 
     def test_not_one_fits(self):
@@ -163,12 +171,28 @@ class Pmp2sdpMemoryInStep(unittest.TestCase):
 
     def test_resume_keeps_k_unless_the_node_type_changes(self):
         kept = {"node_type": "amd1", "procs": 16, "peak_mb": 25805, "k": 8, "measured_at_step": 1}
-        calls, _, log = self.steps(execute.Node("h-1", "amd1", 128, 253099), 99 * GIB, n_steps=1, sdp_mem=kept)
+        calls, _, log, _ = self.steps(execute.Node("h-1", "amd1", 128, 253099), 99 * GIB, n_steps=1, sdp_mem=kept)
         self.assertEqual(calls, [(8, 8, 16)])
         self.assertIn("measured at step 1", log)
-        calls, r, _ = self.steps(execute.Node("h-1", "amd2", 256, 376000), 28.6 * GIB, n_steps=1, sdp_mem=kept)
+        calls, r, _, _ = self.steps(execute.Node("h-1", "amd2", 256, 376000), 28.6 * GIB, n_steps=1, sdp_mem=kept)
         self.assertEqual(calls, [(1, 1, 31), (7, 7, 31)])
         self.assertEqual(r.sdp_mem["node_type"], "amd2")
+
+    def test_bench_row_instead_of_measuring(self):
+        """A bootlab bench row of this model, Lambda, precision and processes gives k at step 1: no measurement;
+        another precision's row does not. The generator works at the call's precision below full."""
+        row = {"model": "seven", "lambda": 23, "precision": 512, "procs": 31, "held_mb": 20480,
+               "source": "bootlab bench 2026-11-15, test"}
+        node = execute.Node("h-1", "amd2", 256, 376000)
+        calls, r, log, gen = self.steps(node, 99 * GIB, sdp_build=[row], bits=512)
+        self.assertEqual(calls, [(8, 8, 31), (8, 8, 31)])
+        self.assertEqual((r.sdp_mem["k"], r.sdp_mem["peak_mb"], r.sdp_mem["precision"]), (15, 20480, 512))
+        self.assertNotIn("to measure its memory", log)
+        self.assertIn("bench: bootlab bench 2026-11-15, test", log)
+        self.assertEqual(gen, [512, 512])
+        calls, _, log, gen = self.steps(node, 28.6 * GIB, n_steps=1, sdp_build=[row])
+        self.assertEqual(calls, [(1, 1, 31), (7, 7, 31)])
+        self.assertEqual(gen, [None])
 
     def test_resume_state_takes_it_from_solves(self):
         kept = {"node_type": "amd1", "procs": 16, "peak_mb": 25805, "k": 8, "measured_at_step": 1}
@@ -204,6 +228,129 @@ def jumped(n: int, cumulative: int) -> execute.Dive:
     return d
 
 
+class BlockTables(unittest.TestCase):
+    """Run.prune_blocks after each generator call (made-up generator): the tables of the last two calls and those
+    with Delta12 = Delta34 = 0 stay, the others go; a resume's leftovers go after its first call; driver.log says
+    how much is kept and removed. Without it a run had filled a 402 GB disk with block tables."""
+
+    def setUp(self):
+        import dataclasses
+        tmp = Path(tempfile.mkdtemp())
+        site = dataclasses.replace(execute.load_site("lab", FIXTURES), scratch=str(tmp / "scratch"))
+        (tmp / "run").mkdir()
+        self.p = inputs.load(EXAMPLE)
+        self.r = skydive.Run(self.p, site, execute.Node("h-1", "amd1", 128, 253099), tmp / "run")
+        self.x = dict(zip(self.p.coords, self.p.run["skydive"]["start"]))
+
+    @staticmethod
+    def table(d12, d34="0", spin=0):
+        return f"zzbDerivTable-d3-delta12-{d12}-delta34-{d34}-L0-nmax10-keptPoleOrder14-order60-spin{spin}.json"
+
+    def t(self, d12, bits=None):
+        """A table's path under <scratch>/blocks: in its precision's directory."""
+        return f"p{bits or self.p.solver_precision()}/{self.table(d12)}"
+
+    def call(self, n, deltas, bits=None):
+        """One generator call that needs the tables of these Delta12 (and Delta12 = 0), building the missing."""
+        def generate(site_, node_, request, log, stall_s=None):
+            req = json.loads(request.read_text())
+            blocks = Path(req["blocks"])
+            blocks.mkdir(parents=True, exist_ok=True)
+            for d in ["0", *deltas]:
+                f = blocks / self.table(d)
+                if not f.exists():
+                    f.write_text("x" * 100)
+            for point in req["points"]:
+                (Path(req["out"]) / point["name"]).mkdir(parents=True, exist_ok=True)
+                (Path(req["out"]) / point["name"] / "pmp.nsv").write_text("")
+        with mock.patch.object(skydive.pmp, "generate", generate):
+            self.r.make_pmps(n, self.x, bits or self.p.solver_precision())
+        return sorted(skydive.block_tables(self.r.blocks))
+
+    def test_recent_calls_and_zero_deltas_kept(self):
+        leftover = self.r.blocks / self.table("-0.25", "0.125")        # a resume's scratch from an earlier job
+        leftover.parent.mkdir(parents=True)                            # (blocks/ itself, before p<bits>/)
+        leftover.write_text("old")
+        self.assertEqual(self.call(1, ["0.1", "-0.1"]), sorted(self.t(d) for d in ("0", "0.1", "-0.1")))
+        self.assertFalse(leftover.exists())
+        self.call(2, ["0.2", "-0.2"])
+        self.assertEqual(self.call(3, ["0.3", "-0.3"]),
+                         sorted(self.t(d) for d in ("0", "0.2", "-0.2", "0.3", "-0.3")))
+        self.assertEqual(self.call(3, ["0.3", "-0.3"]),           # the same call again: nothing new, nothing lost
+                         sorted(self.t(d) for d in ("0", "0.3", "-0.3")))
+        log = (self.r.dir / "driver.log").read_text()
+        self.assertIn("step 1: block tables 3 files", log)
+        self.assertIn("1 files, 0.0 GB removed", log)
+        self.assertIn("step 3: block tables 5 files", log)
+
+    def test_each_precision_its_own_tables(self):
+        """The same point at 512 bits, then at full precision (the solve after an optimal call): the second call
+        builds its own tables (the file name has no precision; one directory would hand it the 512-bit ones)."""
+        full = self.p.solver_precision()
+        self.call(4, ["0.4"], bits=512)
+        self.assertEqual(self.call(4, ["0.4"]), sorted([self.t("0", 512), self.t("0.4", 512), self.t("0"), self.t("0.4")]))
+        log = (self.r.dir / "driver.log").read_text().splitlines()
+        self.assertIn("(2 made by this call)", log[-1])
+        self.assertTrue(all(f.startswith(f"p{full}/") for f in self.r.block_calls[-1]))
+
+    def test_x_independent(self):
+        self.assertTrue(skydive.x_independent(self.table("0")))
+        self.assertTrue(skydive.x_independent(self.table("0.0", "0e0")))
+        self.assertFalse(skydive.x_independent(self.table("0", "0.5")))
+        self.assertFalse(skydive.x_independent(self.table("-0.8944759576918505044079432444345")))
+        self.assertFalse(skydive.x_independent("lock-zzbDerivTable"))
+
+
+class GeneratorWatchdog(unittest.TestCase):
+    """A generator call whose logs and directories stay unchanged too long ends the run as unfinished (a generator once
+    hung silently in its parts stage for 1 h 48 min); the limit is 5 times the run's first call, at least 10 min,
+    1 h before a call has been timed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "steps" / "1" / "generator"
+        self.log.parent.mkdir(parents=True)
+
+    def proc(self, code):
+        return subprocess.Popen([sys.executable, "-c", code], stdout=open(self.log.with_suffix(".out"), "w"),
+                                stderr=open(self.log.with_suffix(".err"), "w"))
+
+    def test_silent_program_ended(self):
+        p = self.proc("import sys, time; print('pmp: blocks done at 25 s', file=sys.stderr, flush=True); time.sleep(60)")
+        t = time.time()
+        with self.assertRaises(execute.Stalled) as e:
+            execute.wait_watched(p, [self.log.with_suffix(".err")], 1.0, "generator", self.log, poll=0.2)
+        self.assertLess(time.time() - t, 30)
+        self.assertIsNotNone(p.poll())                                       # ended
+        self.assertIn("generator stalled after", str(e.exception))
+        self.assertIn("its last lines: pmp: blocks done at 25 s", str(e.exception))
+
+    def test_busy_program_finishes(self):
+        p = self.proc("import sys, time\nfor i in range(6):\n    print(i, file=sys.stderr, flush=True); time.sleep(0.4)")
+        self.assertEqual(execute.wait_watched(p, [self.log.with_suffix(".err")], 1.0, "generator", self.log, poll=0.2), 0)
+
+    def test_limit_and_skydive_failure(self):
+        import dataclasses
+        site = dataclasses.replace(execute.load_site("lab", FIXTURES), scratch=str(self.tmp / "scratch"))
+        (self.tmp / "run").mkdir()
+        p = inputs.load(EXAMPLE)
+        r = skydive.Run(p, site, execute.Node("h-1", "amd1", 128, 253099), self.tmp / "run")
+        self.assertEqual(r.generator_stall_s(), skydive.GENERATOR_STALL_DEFAULT)
+        r.gen_first_s = 30
+        self.assertEqual(r.generator_stall_s(), skydive.GENERATOR_STALL_FLOOR)
+        r.gen_first_s = 400
+        self.assertEqual(r.generator_stall_s(), 2000)
+        r.gen_first_s = None
+        hang = lambda *a, **k: self.proc("import time; time.sleep(60)")
+        x = dict(zip(p.coords, p.run["skydive"]["start"]))
+        with mock.patch.object(skydive, "GENERATOR_STALL_DEFAULT", 1.0),                 mock.patch.object(execute, "STALL_POLL_SECONDS", 0.2),                 mock.patch.object(skydive.pmp.execute, "launch", hang):
+            with self.assertRaises(execute.Stalled) as e:
+                r.make_pmps(1, x, p.solver_precision())
+        self.assertIn("generator stalled after", str(e.exception))
+        self.assertIn("the limit: no call timed yet: the default", str(e.exception))
+        self.assertIn("generator watchdog: 1 s without output", (self.tmp / "run" / "driver.log").read_text())
+
+
 class Loop(unittest.TestCase):
     """The loop's endings and records, and a resume, with made-up steps in place of the programs."""
 
@@ -220,9 +367,14 @@ class Loop(unittest.TestCase):
             (self.dir / name).write_text(name)
 
     def run_loop(self, dives, max_steps, state=None, first_only=False, track=None, kappa=None, tighten=None,
-                 boundary=False, mixed=False, jumps=False):
+                 boundary=False, mixed=False, jumps=False, keep=None, by_call=False):
+        """by_call: dives[k] is the (k+1)-th call's, not step k+1's (a step done again takes the next); every call
+        notes the generation checkpoint.json named when it began in self.loaded (None: a cold start)."""
         p = inputs.load(EXAMPLE)
+        self.loaded = []
         p.run["skydive"]["max_steps"] = max_steps
+        if keep is not None:
+            p.run["skydive"]["keep_checkpoints"] = keep
         if mixed:
             p.run["skydive"]["mixed_precision"] = True
         if jumps:
@@ -244,9 +396,13 @@ class Loop(unittest.TestCase):
 
         def step(n, x, st, procs):
             seen.append((n, dict(x), dict(st)))
+            self.loaded.append(execute.generation(r.ck) if (r.ck / "checkpoint.json").exists() else None)
             (self.dir / "steps" / str(n)).mkdir(parents=True, exist_ok=True)
-            if dives[n - 1] is None:
+            dive = dives[len(seen) - 1] if by_call else dives[n - 1]
+            if dive is None:
                 raise execute.StepFailed("pmp2sdp exit 1")
+            if isinstance(dives[n - 1], Exception):
+                raise dives[n - 1]
             sdir = r.scratch / f"step_{n}"
             (sdir / "out").mkdir(parents=True)
             (sdir / "out" / "out.txt").write_text("out")
@@ -263,7 +419,7 @@ class Loop(unittest.TestCase):
             (r.ck / "checkpoint.json").write_text(json.dumps({"current": n, "backup": n - 1}))
             (r.ck / "block_timings").write_text("1\n")
             r.keep_generation(4, st["precision"])
-            return dives[n - 1], 4, {}, sdir, nsv
+            return dive, 4, {}, sdir, nsv
 
         s = state or skydive.start_state(p)
         with mock.patch.object(r, "step", step):
@@ -272,13 +428,15 @@ class Loop(unittest.TestCase):
 
     def assert_checkpoint(self, n):
         """checkpoint/ (the solver's, in the run directory) at step n's generation, kept for the last record
-        alone: hard links to its 4 rank files, checkpoint.json, block_timings and layout.json (one node, 4
-        processes); no kept/*.new left."""
+        as the newest of at most inputs.KEEP_CHECKPOINTS kept/ (keep_checkpoints left out): hard links to its 4
+        rank files, checkpoint.json, block_timings and layout.json (one node, 4 processes); no kept/*.new left."""
         ck = self.dir / "checkpoint"
         self.assertEqual(execute.generation(ck), n)
         records = len((self.dir / "solves.jsonl").read_text().splitlines())
         k = execute.kept_for(ck, records)
-        self.assertEqual([p.name for p in (ck / "kept").iterdir()], [k.name])
+        names = sorted(int(p.name) for p in (ck / "kept").iterdir())      # int(): no kept/*.new
+        self.assertEqual(names[-1], int(k.name))
+        self.assertLessEqual(len(names), inputs.KEEP_CHECKPOINTS)
         self.assertEqual(sorted(f.name for f in k.iterdir()),
                          ["block_timings", "checkpoint.json"] + [f"checkpoint_{n}_{r}" for r in range(4)] + ["layout.json"])
         self.assertTrue(os.path.samefile(k / f"checkpoint_{n}_3", ck / f"checkpoint_{n}_3"))
@@ -327,14 +485,59 @@ class Loop(unittest.TestCase):
         self.assertIn("optimal at 512 bits", lines[2]["precision_note"])
         self.assertTrue((self.dir / "steps" / "3-512bits").is_dir())
 
-    def test_mixed_precision_health_check(self):
-        """findMinimumQ changing at 512 bits: full precision from the next call on, never lowered again."""
-        d3 = stepped(3)
-        d3.find_minimum = True
-        _, seen, _ = self.run_loop([stepped(1), stepped(2), d3, stepped(4), stepped(5)], 5, mixed=True)
-        self.assertEqual([st["precision"] for _, _, st in seen], [512, 512, 512, 785, 785])
+    def left(self, n):
+        d = stepped(n)
+        d.find_minimum = True
+        return d
+
+    def test_mixed_precision_confirmed(self):
+        """findMinimumQ changing at 512 bits: step 3 again at 785 bits, at the same point with the same BFGS state,
+        from generation 2 (the one before it); it changes there too: the path's, not the precision's; 512 bits again
+        from step 4, which starts from the full precision call's step and generation."""
+        _, seen, _ = self.run_loop([stepped(1), stepped(2), self.left(3), self.left(3), stepped(4)], 4, mixed=True,
+                                   by_call=True)
+        self.assertEqual([(n, st["precision"]) for n, _, st in seen], [(1, 512), (2, 512), (3, 512), (3, 785), (4, 512)])
+        self.assertEqual(seen[3][1], seen[2][1])
+        self.assertEqual(seen[3][2]["prev_hessian"], seen[2][2]["prev_hessian"])
+        self.assertEqual(self.loaded, [None, 1, 2, 2, 3])
+        self.assertTrue((self.dir / "steps" / "3-512bits").is_dir())
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([l["precision_state"] for l in lines], ["low", "low", "confirm", "low", "low"])
+        self.assertIn("left the allowed region): the same call again at full precision", lines[2]["precision_note"])
+        self.assertIn("confirmed at full precision", lines[3]["precision_note"])
+
+    def test_mixed_precision_back_down(self):
+        """findMinimumQ changing at 512 bits but not at 785: the precision's; full precision until 3 healthy calls
+        at full in a row (the confirming call and steps 4, 5), then 512 bits again: the checkpoint is converted down
+        before step 6 (Run.step's match_checkpoint, not called here)."""
+        _, seen, _ = self.run_loop([stepped(1), stepped(2), self.left(3), stepped(3), stepped(4), stepped(5),
+                                    stepped(6)], 6, mixed=True, by_call=True)
+        self.assertEqual([st["precision"] for _, _, st in seen], [512, 512, 512, 785, 785, 785, 512])
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([l["precision_state"] for l in lines], ["low", "low", "confirm", "high", "high", "low", "low"])
+        self.assertIn("back to 512 bits (return 1 of 2)", lines[5]["precision_note"])
+
+    def test_mixed_precision_resume_confirm(self):
+        """A job ended after a record in state confirm: the resume does that call again at the same point with the
+        state of the step before it, at full precision, from the generation kept for the record before it."""
+        from bootlab import cli
+        self.run_loop([stepped(1), stepped(2), self.left(3), stepped(3), stepped(4)], 4, mixed=True, by_call=True)
+        lines = (self.dir / "solves.jsonl").read_text().splitlines()
+        (self.dir / "solves.jsonl").write_text("\n".join(lines[:3]) + "\n")
         s = skydive.resume_state(inputs.load(EXAMPLE), self.dir, hot=True)
-        self.assertEqual(s["bfgs"]["precision"], 785)
+        self.assertEqual((s["n"], s["x"]["deltaSig"], s["bfgs"]["precision"]), (2, "0.5192", 785))
+        self.assertEqual(s["bfgs"]["prev_hessian"][0], "2")
+        self.assertEqual(cli.resume_records(self.dir), 2)
+
+    def test_mixed_precision_aborted(self):
+        """Aborted at 512 bits: again at 785; aborted there too: the run ends unfinished (failures end the run)."""
+        ab = execute.Dive("aborted", "maxIterations exceeded", call_iterations=7)
+        ab2 = execute.Dive("aborted", "maxIterations exceeded", call_iterations=7)
+        _, seen, res = self.run_loop([stepped(1), stepped(2), ab, ab2], 4, mixed=True, by_call=True)
+        self.assertEqual([st["precision"] for _, _, st in seen], [512, 512, 512, 785])
+        self.assertEqual(res["status"], "unfinished")
+        lines = [json.loads(l) for l in (self.dir / "solves.jsonl").read_text().splitlines()]
+        self.assertEqual([l["precision_state"] for l in lines], ["low", "low", "confirm", "locked"])
 
     def test_mixed_precision_off(self):
         """Without mixed_precision: the problem's precision at every call, no precision_next."""
@@ -366,7 +569,8 @@ class Loop(unittest.TestCase):
         _, seen, res = self.run_loop([jumped(1, 100), jumped(2, 103), d3, jumped(4, 109)], 4, jumps=True)
         self.assertEqual(len(seen), 3)
         self.assertEqual((res["status"], res["reason"]),
-                         ("stopped", "stopped: findMinimumQ changed after a step 8 times ahead"))
+                         ("stopped", "stopped: findMinimumQ changed to true after a step 8 times ahead (left the "
+                                     "allowed region)"))
         self.assertEqual(res["x"], ["0.5199", "1.4", "0.956"])
 
     def test_large_steps_box(self):
@@ -495,6 +699,32 @@ class Loop(unittest.TestCase):
         self.assert_checkpoint(1)
         s = skydive.resume_state(inputs.load(EXAMPLE), self.dir, hot=True)
         self.assertEqual((s["n"], s["x"]["deltaSig"], s["boundary_on"]), (1, "0.5191", False))
+
+    def test_stalled_generator_then_resume(self):
+        """A generator that stalled (execute.Stalled) ends the run as unfinished, the checkpoint of the step before
+        kept, and a resume does the step again (as after maxRuntime)."""
+        stalled = execute.Stalled("generator stalled after 3700 s without output (limit 3600 s); its last lines: x")
+        _, _, res = self.run_loop([stepped(1), stalled], 10)
+        self.assertEqual((res["status"], res["steps"]), ("unfinished", 1))
+        self.assertTrue(res["reason"].startswith("unfinished: generator stalled after 3700 s"))
+        last = json.loads((self.dir / "solves.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((last["verdict"], last["reason"][:29]), ("aborted", "unfinished: generator stalled"))
+        self.assert_checkpoint(1)
+        s = skydive.resume_state(inputs.load(EXAMPLE), self.dir, hot=True)
+        self.assertEqual(s["n"], 1)
+
+    def test_keep_checkpoints(self):
+        """[skydive] keep_checkpoints: 4 steps leave the newest 2 kept/ when left out, 1 or 3 when set."""
+        import shutil
+        for keep, want in ((None, ["3", "4"]), (1, ["4"]), (3, ["2", "3", "4"])):
+            with self.subTest(keep=keep):
+                for f in ("solves.jsonl", "result.json"):
+                    (self.dir / f).unlink(missing_ok=True)
+                shutil.rmtree(self.dir / "checkpoint", ignore_errors=True)
+                shutil.rmtree(self.dir / "steps", ignore_errors=True)
+                shutil.rmtree(self.tmp / "scratch", ignore_errors=True)
+                self.run_loop([stepped(1), stepped(2), stepped(3), stepped(4)], 4, keep=keep)
+                self.assertEqual(sorted(p.name for p in (self.dir / "checkpoint" / "kept").iterdir()), want)
 
     def test_max_steps_then_resume(self):
         """Stopped after 2 steps and resumed: steps 3 and 4 get what they get in a run that is not stopped."""

@@ -1,0 +1,28 @@
+# <JJJJ> C_T bound at three of DPTV's points, with upstream's jjjj_test_nmax6 settings (JJJJ2025.paramsNmax6),
+# for the comparison with upstream's own run of them: 12 gamma = 0, -1, +1.
+format = "bootlab-run/1"
+name   = "jjjj-nmax6"
+
+[inputs]
+model     = "model.json"
+spectrum  = "spectrum.toml"
+objective = "objective.toml"
+
+# Upstream's SimpleBoundParams: nmax = (lambda + 1) / 2, block order, poles kept, spins 0..max_spin, precision.
+[numerics]
+lambda          = 11
+order           = 60
+num_poles       = 20
+max_spin        = 40
+block_precision = 768
+
+[coords]
+names = ["x"]
+
+[scan]
+points = [["0"], ["-1"], ["1"]]
+
+# sdpb's options by flag name, over the bound's own (upstream's jjjj3dBound: optimizationParams at nmax,
+# precision, initial matrix scales 1e20) and maxRuntime (the job's time left less 15 minutes).
+[solver]
+

@@ -8,13 +8,42 @@ the endings below. Nothing is retried.
 """
 import hashlib
 import json
+import re
 import shutil
 import time
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
 from . import bench, execute, inputs, jump, pmp, precision
 from .numbers import decimal_text, frac
+
+# Run.generator_stall_s: a generator call whose logs and directories stay unchanged this long ends the run as unfinished
+# (execute.wait_watched): FACTOR times the run's first call (its wall time, the block tables built), at least FLOOR;
+# DEFAULT before any call has been timed. A generator once hung silently in its parts stage for 1 h 48 min.
+GENERATOR_STALL_FACTOR = 5
+GENERATOR_STALL_FLOOR = 600
+GENERATOR_STALL_DEFAULT = 3600
+
+# Run.prune_blocks: the generator calls whose new block tables are kept, and the key of a table's file name.
+BLOCK_CALLS_KEPT = 2
+TABLE_DELTAS = re.compile(r"-delta12-(.+?)-delta34-(.+?)-L")
+
+
+def block_tables(d: Path) -> dict:
+    """The files under the block directory d (paths relative to it) and their sizes; {} before it exists."""
+    return {str(f.relative_to(d)): f.stat().st_size for f in d.rglob("*") if f.is_file()} if d.exists() else {}
+
+
+def x_independent(name: str) -> bool:
+    """A block table whose Delta12 and Delta34 are both 0 (its file name says so): the same at every point."""
+    m = TABLE_DELTAS.search(Path(name).name)
+    if not m:
+        return False
+    try:
+        return all(Decimal(v) == 0 for v in m.groups())
+    except InvalidOperation:
+        return False
 
 # The options of dynamical_sdp that bt r3.8 passes when the parameter file leaves them out: upstream's
 # defaultDynamicalConfig (dynamical-sdp, Projects.SkydivingRun). run.toml [dynamical] overrides them.
@@ -142,6 +171,101 @@ class Run:
         self.started = execute.now()
         self.sdp_mem = None         # pmp2sdp's measured memory and k (build_sdps); a resume sets it
         self.sif_sha256 = None      # the image's, worked out once at the start (cli.note_image)
+        self.pmp2sdp = site.pmp2sdp           # a built-in model's are its generator's (builtin.Skydive)
+        self.dynamical_sdp = site.dynamical_sdp
+        self.pmp_ahead_s = 0.0      # a step's PMPs made before it (builtin.Skydive.threshold_setting): their time
+        self.block_calls = []       # the block tables each of the last BLOCK_CALLS_KEPT generator calls made (prune_blocks)
+        self.gen_first_s = None     # this Run's first generator call, its wall time (generator_stall_s)
+        self.stall_logged = None
+
+    # ------------------------------------------------------------ what a built-in model replaces (builtin.Skydive)
+
+    def make_pmps(self, n: int, x: dict, bits: int):
+        """Step n's PMPs, of x and its neighbours, in one generator call: (step directory, logs, name -> pmp.nsv)."""
+        sdir = self.scratch / f"step_{n}"
+        logs = self.dir / "steps" / str(n)
+        pts = self.points(x)
+        req = pmp.write_request(self.p, self.model_file, pts, sdir / "pmp", self.blocks / f"p{bits}", self.node.cores,
+                                bits)
+        if "blockPrecision" in json.loads(req.read_text())["model"] and bits < self.p.solver_precision():
+            self.log(f"step {n}: the generator at {bits} bits too")
+        before = block_tables(self.blocks)
+        self.timed_generator(n, lambda stall: pmp.generate(self.site, self.node, req, logs / "generator",
+                                                           stall_s=stall))
+        self.prune_blocks(n, before)
+        return sdir, logs, pmp.pmp_lists(sdir / "pmp", pts)
+
+    def generator_stall_s(self) -> float:
+        """How long a generator call may leave its logs and directories unchanged (GENERATOR_STALL_*)."""
+        if self.gen_first_s is None:
+            return GENERATOR_STALL_DEFAULT
+        return max(GENERATOR_STALL_FLOOR, GENERATOR_STALL_FACTOR * self.gen_first_s)
+
+    def timed_generator(self, n: int, call):
+        """call(stall_s): one generator call under the watchdog; the first call's wall time sets the limit of the
+        later ones. driver.log says the limit whenever it changes."""
+        stall = self.generator_stall_s()
+        how = (f"{GENERATOR_STALL_FACTOR} x this run's first call ({self.gen_first_s:.0f} s), at least "
+               f"{GENERATOR_STALL_FLOOR} s" if self.gen_first_s is not None else "no call timed yet: the default")
+        if stall != self.stall_logged:
+            self.log(f"step {n}: generator watchdog: {stall:.0f} s without output ends the run ({how})")
+            self.stall_logged = stall
+        try:
+            wall = call(stall)
+        except execute.Stalled as e:
+            raise execute.Stalled(f"{e}; the limit: {how}") from None
+        if self.gen_first_s is None:
+            self.gen_first_s = wall
+
+    def prune_blocks(self, n: int, before: dict):
+        """After a generator call: the block tables under <scratch>/blocks that neither of the last BLOCK_CALLS_KEPT
+        calls made and that depend on x removed, and the directory's size logged. The generator builds a table only
+        when its file is missing (scalar-blocks Build.checkCreated), so a removed table that is needed again is
+        built again: nothing but time is at stake. A table's key has Delta12 and Delta34 (file name
+        zzbDerivTable-d3-delta12-<r>-delta34-<r>-L...) but not the precision: make_pmps gives each precision its own
+        directory, blocks/p<bits>, or a call at full precision after one at 512 bits at the same point would read
+        the 512-bit tables (so it did in an earlier version). The
+        Deltas change with the external dimensions, so the tables of one step are of no use to the next, except
+        those with both 0 (pairs of one operator), which every step uses and which are kept. Kept: the last call's
+        (a call at the same point and precision again; OPE neighbours share the centre's within a call) and the one
+        before (the full precision solve after an optimal call builds its own in its precision's directory). Tables
+        there at the run's start (a resume's scratch from an earlier job) are no call's: gone after the first call.
+        Without pruning, a larger problem (Lambda 23) had filled a 402 GB local disk in about 60 steps. A built-in model's generator keeps its blocks between steps on purpose (builtin.Skydive.make_pmps):
+        not here."""
+        now = block_tables(self.blocks)
+        self.block_calls = (self.block_calls + [set(now) - set(before)])[-BLOCK_CALLS_KEPT:]
+        keep = set().union(*self.block_calls)
+        gone = [f for f in now if f not in keep and not x_independent(f)]
+        for f in gone:
+            (self.blocks / f).unlink()
+        gb = lambda fs: round(sum(now[f] for f in fs) / 2 ** 30, 2)
+        left = [f for f in now if f not in gone]
+        self.log(f"step {n}: block tables {len(left)} files, {gb(left)} GB kept ({len(self.block_calls[-1])} made by "
+                 f"this call); {len(gone)} files, {gb(gone)} GB removed")
+
+    def solver_base(self) -> dict:
+        """The solver's options under run.toml [solver]: bt's Skydive defaults at the problem's nmax."""
+        return solver_defaults((self.p.numerics["lambda"] + 1) // 2)
+
+    def threshold_setting(self, n: int, x: dict, bits: int) -> str:
+        """dualityGapThreshold's setting for the steps from n + 1 on (n the steps done, x the next point, bits the
+        next call's precision)."""
+        return {**self.solver_base(), **self.p.run.get("solver", {})}["dualityGapThreshold"]
+
+    def call_precision(self, bfgs: dict) -> int:
+        """The next call's precision: the problem's; with mixed_precision the one chosen before (bfgs), else the
+        one for gap_upper_limit (precision.choose); its checkpoint is converted to it, up or down (match_checkpoint)."""
+        full = self.p.solver_precision()
+        mixed = self.opts.get("mixed_precision", False)
+        return (bfgs.get("precision") or precision.choose(full, self.opts["gap_upper_limit"])) if mixed else full
+
+    def optimal(self, dive, boundary: bool) -> tuple:
+        """(status, reason) of a run whose call ended optimal at full precision."""
+        return optimal_ending(dive.primal, dive.dual, boundary)
+
+    def versions(self) -> dict:
+        return {"sif": self.site.sif, "sif_sha256": self.sif_sha256, "generator": self.site.generator,
+                "pmp2sdp": self.pmp2sdp, "dynamical_sdp": self.dynamical_sdp}
 
     # ------------------------------------------------------------ records
 
@@ -163,7 +287,10 @@ class Run:
     def record(self, line: dict):
         with open(self.dir / "solves.jsonl", "a") as f:
             f.write(json.dumps(line) + "\n")
-        execute.prune_kept(self.ck, self.records())
+        # a record in state confirm: its call is done again from the generation before it, which stays
+        execute.prune_kept(self.ck, self.records(),
+                           self.p.run.get("skydive", {}).get("keep_checkpoints", inputs.KEEP_CHECKPOINTS)
+                           + (line.get("precision_state") == "confirm"))
 
     def inputs_sha(self) -> dict:
         out = {name: hashlib.sha256((self.dir / name).read_bytes()).hexdigest()
@@ -177,9 +304,7 @@ class Run:
         result = {"status": status, "reason": reason, "x": [x[c] for c in self.p.coords], "coords": self.p.coords,
                   "navigator": navigator, "primal": dive.primal if dive else None, "dual": dive.dual if dive else None,
                   "gap": dive.gap if dive else None, "steps": steps, "inputs": self.inputs_sha(),
-                  "versions": {"sif": self.site.sif, "sif_sha256": self.sif_sha256,
-                               "generator": self.site.generator, "pmp2sdp": self.site.pmp2sdp,
-                               "dynamical_sdp": self.site.dynamical_sdp},
+                  "versions": self.versions(),
                   "start": self.started, "end": execute.now()}
         if n_bound is not None:
             result["n_bound"] = n_bound
@@ -202,18 +327,14 @@ class Run:
 
     def step(self, n: int, x: dict, state: dict, procs):
         """Step n (from 1). Returns (Dive, procs, seconds)."""
-        sdir = self.scratch / f"step_{n}"
-        logs = self.dir / "steps" / str(n)
-        pts = self.points(x)
         seconds = {}
         t = time.time()
-        req = pmp.write_request(self.p, self.model_file, pts, sdir / "pmp", self.blocks, self.node.cores)
-        pmp.generate(self.site, self.node, req, logs / "generator")
-        lists = pmp.pmp_lists(sdir / "pmp", pts)
-        seconds["pmp"] = round(time.time() - t, 1)
+        bits = state["precision"]
+        sdir, logs, lists = self.make_pmps(n, x, bits)
+        seconds["pmp"] = round(time.time() - t + self.pmp_ahead_s, 1)
+        self.pmp_ahead_s = 0.0
 
         t = time.time()
-        bits = state["precision"]
         sdps = self.build_sdps(n, lists, sdir / "sdp", logs, bits)
         seconds["sdp"] = round(time.time() - t, 1)
         if self.node.others:         # pmp2sdp ran on node 0; every node reads the SDPs from its own disk (a shared
@@ -227,13 +348,12 @@ class Run:
         if procs is None:
             n_q, blocks = execute.sdp_size(sdps["c"])
             procs, why = bench.solver_procs(bench.load_bench(self.site.bench_dir, self.node.node_type),
-                                            self.node.cores, n_q, blocks)
+                                            self.node.cores, n_q, blocks, self.dynamical_sdp)
             self.log(f"solver processes {procs}: {why}")
 
         t = time.time()
-        nmax = (self.p.numerics["lambda"] + 1) // 2
-        self.raise_checkpoint(bits)
-        solver = {"precision": bits, **solver_defaults(nmax),
+        self.match_checkpoint(bits)
+        solver = {"precision": bits, **self.solver_base(),
                   **({"maxRuntime": execute.job_seconds_left() - 900} if self.node.launcher != "local" else {}),
                   **self.p.run.get("solver", {}),
                   "dualityGapThreshold": state["gap_threshold"]}
@@ -242,7 +362,8 @@ class Run:
         out = sdir / "out"
         code = execute.run_dynamical_sdp(self.site, self.node, procs, sdps["c"],
                                          [sdps[f"plus_{i}"] for i in range(len(self.p.coords))],
-                                         out, self.ck, solver, dynamical, state, logs / "dynamical_sdp")
+                                         out, self.ck, solver, dynamical, state, logs / "dynamical_sdp",
+                                         program=self.dynamical_sdp)
         seconds["dive"] = round(time.time() - t, 1)
         dive = execute.read_dive(out, code, (logs / "dynamical_sdp").with_suffix(".out"))
         for f in ("out.txt", "skydiving_out.txt"):
@@ -271,9 +392,9 @@ class Run:
         lay = json.loads((kept / "layout.json").read_text())
         return lay, lay.get("precision", self.p.solver_precision())
 
-    def raise_checkpoint(self, bits: int):
-        """Before a call at `bits`: its checkpoint converted when kept at a lower precision (never higher: the
-        call's precision is at least the checkpoint's, loop)."""
+    def match_checkpoint(self, bits: int):
+        """Before a call at `bits`: its checkpoint converted when kept at another precision (up, or down when a
+        mixed precision run goes back down, precision.decide)."""
         kept = self.checkpoint_kept()
         if kept is None or kept[1] == bits:
             return
@@ -291,18 +412,30 @@ class Run:
         peak, and k = bench.pmp2sdp_at_once of it; the other points follow k at a time. Later steps convert k
         at a time without measuring. self.sdp_mem keeps the node type, the processes, the peak, k and the step
         it was measured at, and the precision (a mixed precision run measures again when it rises; a record
-        without one: the problem's); solves.jsonl records it with each step and a resume takes it from there."""
+        without one: the problem's); solves.jsonl records it with each step and a resume takes it from there.
+        A row of bootlab bench for this model, Lambda, precision and processes on this node type
+        (bench.sdp_build_row) stands for the measurement: k from its held memory, all points k at a time."""
         per = bench.pmp2sdp_procs(self.node.cores, len(lists))
         mem = self.node.mem_mb - self.site.driver_reserve_mb
+        here = (self.node.node_type, per, prec)
         m = self.sdp_mem
-        if m and (m["node_type"], m["procs"], m.get("precision", self.p.solver_precision())) == \
-                (self.node.node_type, per, prec):
+        if not (m and (m["node_type"], m["procs"], m.get("precision", self.p.solver_precision())) == here):
+            row = bench.sdp_build_row(bench.load_bench(self.site.bench_dir, self.node.node_type),
+                                      self.p.model_name, self.p.numerics["lambda"], prec, per)
+            if row and bench.pmp2sdp_at_once(mem, row["held_mb"]) >= 1:
+                m = self.sdp_mem = {"node_type": self.node.node_type, "procs": per, "precision": prec,
+                                    "peak_mb": row["held_mb"], "k": bench.pmp2sdp_at_once(mem, row["held_mb"]),
+                                    "bench": row["source"]}
+        if m and (m["node_type"], m["procs"], m.get("precision", self.p.solver_precision())) == here:
             at_once = min(m["k"], len(lists))
+            how = f"measured at step {m['measured_at_step']}" if "measured_at_step" in m else f"bench: {m['bench']}"
             self.log(f"step {n}: pmp2sdp {len(lists)} SDPs, {at_once} at a time with {per} processes each "
-                     f"(k = {m['k']}: {m['peak_mb']} MB an instance, measured at step {m['measured_at_step']})")
-            return execute.build_sdps(self.site, self.node, lists, sdp_root, prec, logs, at_once, per)[0]
+                     f"(k = {m['k']}: {m['peak_mb']} MB an instance, {how})")
+            return execute.build_sdps(self.site, self.node, lists, sdp_root, prec, logs, at_once, per,
+                                      program=self.pmp2sdp)[0]
         self.log(f"step {n}: pmp2sdp the central point's SDP alone with {per} processes, to measure its memory")
-        sdps, (w,) = execute.build_sdps(self.site, self.node, {"c": lists["c"]}, sdp_root, prec, logs, 1, per)
+        sdps, (w,) = execute.build_sdps(self.site, self.node, {"c": lists["c"]}, sdp_root, prec, logs, 1, per,
+                                        program=self.pmp2sdp)
         if w.get("measure"):         # local mode: what the watchdog read
             self.log(f"step {n}: pmp2sdp's memory measured as {w['measure']}"
                      + (": no smaps_rollup here, RssAnon leaves the shared memory out" if w["measure"] == "rss_anon"
@@ -323,7 +456,8 @@ class Run:
         if rest:
             at_once = min(k, len(rest))
             self.log(f"step {n}: pmp2sdp the other {len(rest)} SDPs, {at_once} at a time with {per} processes each")
-            sdps.update(execute.build_sdps(self.site, self.node, rest, sdp_root, prec, logs, at_once, per)[0])
+            sdps.update(execute.build_sdps(self.site, self.node, rest, sdp_root, prec, logs, at_once, per,
+                                           program=self.pmp2sdp)[0])
         return sdps
 
     # ------------------------------------------------------------ the loop
@@ -334,8 +468,7 @@ class Run:
         run, or a resume without a checkpoint)."""
         o = self.opts
         k = len(self.p.coords)
-        threshold = {**solver_defaults((self.p.numerics["lambda"] + 1) // 2),
-                     **self.p.run.get("solver", {})}["dualityGapThreshold"]
+        threshold = self.threshold_setting(n, x, self.call_precision(bfgs))
         box_min = [frac(v) for v in o["box_min"]]
         box_max = [frac(v) for v in o["box_max"]]
         direction = [str(v) for v in o.get("find_boundary_direction", [])]
@@ -364,8 +497,7 @@ class Run:
                 "hessian_guess": [str(guess[i]) if i == j else "0" for i in range(k) for j in range(k)] if guess else None,
                 "gap_threshold": gap_threshold(threshold, None if first else bfgs.get("prev_navigator"),
                                                o.get("gap_threshold_tighten", True)),
-                "precision": max((bfgs.get("precision") or precision.choose(full, o["gap_upper_limit"]))
-                                 if mixed else full, (self.checkpoint_kept() or (None, 0))[1]),
+                "precision": self.call_precision(bfgs),
             }
             self.log(f"step {n + 1} at {[x[c] for c in self.p.coords]}: gap upper limit {state['gap_upper_limit']}, "
                      f"gap threshold {state['gap_threshold']}, boundary {'on' if state['boundary_direction'] else 'off'}, "
@@ -373,10 +505,11 @@ class Run:
             try:
                 dive, procs, seconds, sdir, center_pmp = self.step(n + 1, x, state, procs)
             except execute.StepFailed as e:
+                status = "unfinished" if isinstance(e, execute.Stalled) else "failed"   # stalled: resumable
                 self.record({"step": n + 1, "x": [x[c] for c in self.p.coords], "verdict": "aborted",
-                             "reason": f"failed: {e}", "procs": procs, **self.where(),
+                             "reason": f"{status}: {e}", "procs": procs, **self.where(),
                              "pmp2sdp": self.sdp_mem, "precision": state["precision"]})
-                return self.finish("failed", f"failed: {e}", x, n)
+                return self.finish(status, f"{status}: {e}", x, n)
             iterations, unknown = record_iterations(dive, state["total_iterations"])
             line = {"step": n + 1, "x": [x[c] for c in self.p.coords], "verdict": dive.verdict, "reason": dive.reason,
                     "navigator": dive.navigator, "primal": dive.primal, "dual": dive.dual, "gap": dive.gap,
@@ -396,7 +529,8 @@ class Run:
                 if state.get("first_call"):
                     line["first_call"] = True
                 if jumps and dive.verdict == "stepped":
-                    line.update(jump.decide(line, history))
+                    line.update(jump.decide(line, precision.live(history),
+                                            o.get("large_steps_sign_cooldown", jump.FOREVER)))
                     if line["jump"] > 1 and not in_box(moved(x, dive.ext_step, line["jump"]), box_min, box_max):
                         line["jump_note"] += f"; {line['jump']} steps ahead would leave the box: 1"
                         line["jump"] = 1
@@ -405,6 +539,11 @@ class Run:
                 if mixed:
                     line.update(self.precision_fields(line, history, full))
             self.record(line)
+            if line.get("precision_state") == "confirm":
+                # the same call again at full precision: the same point and BFGS state, from the generation before it
+                self.confirm_at_full(n + 1, line["precision"], sdir)
+                bfgs = {**bfgs, "precision": full}
+                continue
             if "jump_stop" in line:
                 return self.finish("stopped", f"stopped: {line['jump_stop']}", x, n + 1, dive.navigator, dive)
             if dive.verdict == "aborted":
@@ -418,7 +557,7 @@ class Run:
                 bfgs = {**bfgs, "first_call": False, "total_iterations": dive.iterations, "precision": full}
                 continue
             if dive.verdict == "optimal":
-                status, reason = optimal_ending(dive.primal, dive.dual, bool(state["boundary_direction"]))
+                status, reason = self.optimal(dive, bool(state["boundary_direction"]))
                 if status == "converged":
                     self.keep_endpoint(center_pmp, sdir / "out")
                     # a converged run keeps its endpoint and no checkpoint (docs/en/interfaces.md section 12)
@@ -445,15 +584,27 @@ class Run:
             x, n = x_next, n + 1
 
     def precision_fields(self, line: dict, history: list, full: int) -> dict:
-        """A mixed precision record's precision_next and precision_note (why it is not this call's; left out when
-        it is); line has call_iterations and first_call, history the records before it."""
-        f = {}
-        nxt, note = precision.next_precision(line, history, full)
-        f["precision_next"] = nxt
-        if note:
-            f["precision_note"] = note
-            self.log(f"step {line['step']}: precision: {note}")
+        """A mixed precision record's precision_state, precision_next and precision_note (precision.decide); line
+        has call_iterations and first_call, history the records before it."""
+        f = precision.decide(line, history, full, self.opts)
+        if "precision_note" in f:
+            self.log(f"step {line['step']}: precision: {f['precision_note']}")
         return f
+
+    def confirm_at_full(self, n: int, bits: int, sdir: Path):
+        """Before step n is done again at full precision: its logs moved to steps/<n>-<bits>bits, its scratch
+        removed, and the checkpoint set back to the generation kept for the record before it (none: a cold start,
+        as the call was)."""
+        (self.dir / "steps" / str(n)).rename(self.dir / "steps" / f"{n}-{bits}bits")
+        shutil.rmtree(sdir, ignore_errors=True)
+        execute.on_hosts(self.site, self.node, f"rm -rf {sdir}", self.node.others)
+        before = execute.kept_for(self.ck, self.records() - 1)
+        if before is None:
+            shutil.rmtree(self.ck, ignore_errors=True)
+            self.log(f"step {n}: again at full precision from scratch (no generation before it)")
+        else:
+            g = execute.restore_generation(self.ck, before)
+            self.log(f"step {n}: again at full precision from generation {g}, kept for record {before.name}")
 
     def keep_checkpoint(self):
         """The solver's checkpoint, for a resume to start hot (docs/en/interfaces.md section 11): the run's checkpoint/,
@@ -534,12 +685,15 @@ def resume_state(problem, run_dir: Path, hot: bool) -> dict:
     first call and gets the gap upper limit even when that is for the first call only (docs/en/interfaces.md section 10)."""
     lines = [json.loads(l) for l in (run_dir / "solves.jsonl").read_text().splitlines() if l.strip()]
     last = lines[-1]
-    stepped = [l for l in lines if l["verdict"] == "stepped"]
+    # a last record in state confirm: its call is to be done again at full precision, at the same point with the
+    # state of the step before it (cli.place_checkpoint loads the generation kept for the record before it)
+    confirm = last.get("precision_state") == "confirm"
+    stepped = [l for l in precision.live(lines) if l["verdict"] == "stepped"]
     o = problem.run["skydive"]
     direction = o.get("find_boundary_direction", [])
     # a failed step's line has no boundary_on (a resume after one once stopped at KeyError)
     boundary_on = any(l.get("boundary_on", False) for l in lines) or any(direction and frac(l["navigator"]) < 0 for l in stepped)
-    if last["verdict"] == "stepped":
+    if last["verdict"] == "stepped" and not confirm:
         x = moved(dict(zip(problem.coords, last["x"])), last["ext_step"], last.get("jump", 1))
         ref, n = last, last["step"]
     else:

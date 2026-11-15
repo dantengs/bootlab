@@ -8,8 +8,10 @@ recovers in about 1.2 more iterations a step (measured), against a fixed cost of
   before: c = cos(full step, the previous stepped call's full step), full step = dx / alpha_d;
      m = 1 when cooling down, c <= C1 or the call climbed; 2 when c <= C2; else floor(F / alpha_d) within [1, M];
   after a call that started m_prev > 1 steps ahead:
-     findMinimumQ changed -> the run stops;
-     N changed sign -> no more large steps in this run;
+     findMinimumQ false to true (left the allowed region) -> the run stops; true to false (entered it, the usual
+       path of a run started outside) -> m = 1 for COOL calls, as the health check of mixed precision;
+     N changed sign -> no more large steps in this run; with [skydive] large_steps_sign_cooldown = k (not
+       tested yet), m = 1 for the next k calls only;
      more than 3 + 1.5 (m_prev - 1) iterations, or c < COS_ACCEPT -> the point kept, m = 1 for COOL calls.
 
 Measured on a larger problem (N about 3000) at 1024 bits, 13 h: 1.84 times the progress of the same run without;
@@ -37,9 +39,10 @@ def cosine(u: list, v: list) -> float:
     return sum(a * b for a, b in zip(u, v)) / math.sqrt(sum(a * a for a in u) * sum(b * b for b in v))
 
 
-def decide(line: dict, history: list) -> dict:
+def decide(line: dict, history: list, sign_cooldown: int = FOREVER) -> dict:
     """The large step after the stepped call of record `line` (with call_iterations), the records `history` before
-    it: {jump: m, jump_cooldown, jump_note, and jump_stop (why the run stops) when it does}."""
+    it: {jump: m, jump_cooldown, jump_note, and jump_stop (why the run stops) when it does}. sign_cooldown: the calls
+    at m = 1 after N changed sign following a large step (FOREVER: the research rule, no more large steps)."""
     stepped = [l for l in history if l["verdict"] == "stepped"]
     if not stepped:
         return {"jump": 1, "jump_cooldown": 0, "jump_note": "first step"}
@@ -51,11 +54,18 @@ def decide(line: dict, history: list) -> dict:
     m_prev = prev.get("jump", 1)
     if m_prev > 1:
         it = line.get("call_iterations")
-        if line["find_minimum"] != prev["find_minimum"]:
-            out["jump_stop"] = f"findMinimumQ changed after a step {m_prev} times ahead"
+        if line["find_minimum"] and not prev["find_minimum"]:
+            out["jump_stop"] = f"findMinimumQ changed to true after a step {m_prev} times ahead (left the allowed region)"
+        elif prev["find_minimum"] and not line["find_minimum"]:
+            # entering the allowed region, the usual path of a run started outside; N changes sign
+            # with it, which is that, not a step past the boundary
+            cool = COOL
+            note += f"; entered the allowed region (findMinimumQ true to false) after a step {m_prev} times ahead: " \
+                    f"m = 1 for {COOL} calls"
         elif (float(line["navigator"]) < 0) != (float(prev["navigator"]) < 0):
-            cool = FOREVER
-            note += f"; N changed sign after a step {m_prev} times ahead: no more large steps"
+            cool = sign_cooldown
+            note += f"; N changed sign after a step {m_prev} times ahead: " + (
+                "no more large steps" if sign_cooldown == FOREVER else f"m = 1 for {sign_cooldown} calls")
         elif it is not None and it > 3 + 1.5 * (m_prev - 1):
             cool = COOL
             note += f"; {it} iterations after a step {m_prev} times ahead, over {3 + 1.5 * (m_prev - 1):g}"

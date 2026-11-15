@@ -2,6 +2,9 @@
 <run dir> | stop <run dir> | bench <run.toml> [--node <host>] | regress [--node <host>] [--dry] [--wait] | probe ... |
 site ....
 
+A run is a Skydive, or a scan (one solve per point, one node) when run.toml has [scan] (built-in models,
+docs/en/interfaces.md section 19).
+
 Without Slurm (launcher local, execute.site_launcher) submit starts the driver in the background on this machine
 and stop ends it (README: a workstation without Slurm).
 
@@ -24,7 +27,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from . import bench, benchrun, execute, inputs, layout, probe, regress, sitegen, skydive
+from . import bench, benchrun, builtin, execute, inputs, layout, probe, regress, scan, sitegen, skydive
 
 
 def _new_run_dir(problem, site) -> Path:
@@ -48,7 +51,11 @@ def note_image(r):
     generator among them (result.json versions; the image's /opt/bootlab/MANIFEST lists them)."""
     with open(r.site.sif, "rb") as f:
         r.sif_sha256 = hashlib.file_digest(f, "sha256").hexdigest()
-    r.log(f"image {r.site.sif} sha256 {r.sif_sha256}; generator {r.site.generator} in it")
+    if isinstance(r, builtin.Skydive):       # a built-in model's generator: in the image (container = true) or on the host
+        r.log(f"image {r.site.sif} sha256 {r.sif_sha256}; generator {r.gen['program']} "
+              f"{'in it' if r.gen.get('container') else 'on the host'}; pmp2sdp {r.pmp2sdp}, solver {r.dynamical_sdp}")
+    else:
+        r.log(f"image {r.site.sif} sha256 {r.sif_sha256}; generator {r.site.generator} in it")
 
 
 def here(problem, site) -> execute.Node:
@@ -80,7 +87,7 @@ def make_run(problem, site, node, run_dir: Path):
     scratch, shared, notes = execute.choose_scratch(site, node, run_dir)
     node.shared = shared and node.multi
     site = execute.with_binds(site, [scratch, run_dir])     # run_dir: the solver's checkpoint/
-    r = skydive.Run(problem, site, node, run_dir, scratch)
+    r = (builtin.Skydive if problem.builtin else skydive.Run)(problem, site, node, run_dir, scratch)
     r.scratch_info = {"dir": str(scratch), "shared": shared, "transfer":
                       "none" if node.shared else (site.transfer if node.multi else "none")}
     r.log(f"site {site.name} ({site.site_dir}); runs {site.runs}; driver python {site.python or 'none'}")
@@ -119,6 +126,8 @@ def cmd_run(args):
     if node.launcher == "local":
         execute.write_driver_pid(run_dir)
     problem = inputs.load(run_dir / "run.toml")
+    if "scan" in problem.run:
+        return run_scan(problem, site, node, run_dir, "run")
     r = make_run(problem, site, node, run_dir)
     r.log(f"run {run_dir.name} on {where(node)}")
     for line in start_lines(problem, site, r.site, node):
@@ -152,6 +161,8 @@ def cmd_resume(args):
                 raise SystemExit(f"{run_dir}: its driver (process group {d['pgid']}) still runs: bin/bootlab stop first")
         execute.local_lock(Path(site.runs), f"resume {run_dir}")
         execute.write_driver_pid(run_dir)
+    if "scan" in problem.run:
+        return run_scan(problem, site, node, run_dir, "resume")
     r = make_run(problem, site, node, run_dir)
     hot = place_checkpoint(r, run_dir, last_record(run_dir).get("procs"))   # resume_state's procs
     s = skydive.resume_state(problem, run_dir, hot)
@@ -173,12 +184,38 @@ def cmd_resume(args):
     write_summary(run_dir)
 
 
+def run_scan(problem, site, node, run_dir: Path, how: str):
+    """A scan's run or resume: one node; its scratch chosen as a Skydive's (execute.choose_scratch)."""
+    if node.multi:
+        raise SystemExit(f"a scan runs on one node; this job has {len(node.hosts)}")
+    scratch, _, notes = execute.choose_scratch(site, node, run_dir)
+    site = execute.with_binds(site, [scratch, run_dir])
+    s = scan.Scan(problem, site, node, run_dir, scratch)
+    s.log(f"{how} {run_dir.name} on {where(node)}, from point {s.done()}")
+    for line in [f"launcher {node.launcher}: {node.launcher_why}", f"scratch {scratch}", *notes]:
+        s.log(line)
+    s.log("run.toml:\n" + (run_dir / "run.toml").read_text())
+    for w in problem.warnings:
+        s.log(f"warning: {w}")
+    (run_dir / "result.json").unlink(missing_ok=True)
+    s.run()
+    write_summary(run_dir)
+    return run_dir
+
+
 def records(run_dir: Path) -> list:
     return [json.loads(l) for l in (run_dir / "solves.jsonl").read_text().splitlines() if l.strip()]
 
 
 def last_record(run_dir: Path) -> dict:
     return records(run_dir)[-1]
+
+
+def resume_records(run_dir: Path) -> int:
+    """The records whose kept generation a resume may load: all, but for a last record in state confirm (its call
+    is done again from the generation before it, skydive.resume_state) the ones before it."""
+    lines = records(run_dir)
+    return len(lines) - (lines[-1].get("precision_state") == "confirm" if lines else 0)
 
 
 def before_kept(ck: Path) -> bool:
@@ -202,7 +239,7 @@ def resume_layout(run_dir: Path, site):
     ck = run_dir / "checkpoint"
     if before_kept(ck):
         return old_layout(run_dir, site)
-    kept = execute.kept_for(ck, len(records(run_dir)))
+    kept = execute.kept_for(ck, resume_records(run_dir))
     return json.loads((kept / "layout.json").read_text()) if kept else None
 
 
@@ -215,7 +252,7 @@ def place_checkpoint(r, run_dir: Path, ppn) -> bool:
     if before_kept(ck):
         execute.keep_generation(ck, n, old_layout(run_dir, r.site))
         r.log(f"resume: checkpoint/ from before kept/: its generation {execute.generation(ck)} kept for record {n}")
-    kept = execute.kept_for(ck, n)
+    kept = execute.kept_for(ck, resume_records(run_dir))
     if kept is None:
         r.log("resume: no checkpoint kept")
         shutil.rmtree(ck, ignore_errors=True)
@@ -289,8 +326,8 @@ def cmd_submit(args, what: str = None, time_limit: str = None):
 
 def cmd_bench(args):
     """bootlab bench <run.toml> [--node <host>] [--time] [--dry] (login node): one job of one whole node runs
-    `bench run`, which measures the solver on the run's problem (benchrun) and adds the rows to the site's
-    bench file of that node type."""
+    `bench run`, which measures the generator, pmp2sdp and the solver on the run's problem (benchrun) and adds
+    the rows to the site's bench file of that node type."""
     if len(args.words) > 2 or (len(args.words) == 2 and args.words[0] != "run"):
         raise SystemExit("bootlab bench <run.toml> [--node <host>] | bench run <run.toml>")
     args.action, args.target = ("run", args.words[1]) if len(args.words) == 2 else ("submit", args.words[0])
@@ -315,21 +352,21 @@ def cmd_bench(args):
             f.write(line + "\n")
     for n in notes:
         log(n)
-    log(f"bench of {problem.model['name']} Lambda {problem.numerics['lambda']} on {node.host} "
+    log(f"bench of {problem.model_name} Lambda {problem.numerics['lambda']} on {node.host} "
         f"({node.node_type}, {node.cores} physical cores)")
     try:
         rows = benchrun.measure(problem, site, node, work, Path(scratch), log)
     finally:
         execute.clear(site, node, Path(scratch))
-    if not rows:
+    if not rows["solver"]:
         raise SystemExit(f"bench: no solver row measured (see {work})")
     path = benchrun.append_rows(site.bench_dir, node.node_type, node.cores, rows)
-    log(f"{len(rows)} solver rows added to {path}")
+    log(f"rows added to {path}: " + ", ".join(f"{len(v)} {k}" for k, v in rows.items()))
 
 
 def cmd_regress(args):
     """bootlab regress: on the login node, the regression's inputs (examples/ising, three
-    steps) in <runs>/regress-input-<time>/ and a job of one whole node that runs them and checks them against
+    steps) in <runs>/regress-input-<time>-<pid>/ (two in the same second apart) and a job of one whole node that runs them and checks them against
     bt r3.8's steps (regress.check); in the job (run), the run and the check; check, a run directory anywhere.
     PASS or FAIL in the job's output and in <run dir>/regress.json; FAIL exits 1."""
     if args.action == "check" or args.action == "run":
@@ -339,7 +376,8 @@ def cmd_regress(args):
         (run_dir / "regress.json").write_text(json.dumps(report, indent=1) + "\n")
         raise SystemExit(0 if ok else 1)
     site = execute.load_site(execute.site_name({"site": args.site} if args.site else {}))
-    run_toml = regress.input_dir(Path(site.runs) / f"regress-input-{time.strftime('%Y%m%d-%H%M%S')}", args.site,
+    run_toml = regress.input_dir(Path(site.runs) / f"regress-input-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}",
+                                 args.site,
                                  args.node and [args.node])
     print(f"# inputs {run_toml.parent}")
     if args.wait:              # local mode: run it here and print PASS or FAIL
@@ -348,6 +386,16 @@ def cmd_regress(args):
         return cmd_regress(argparse.Namespace(action="run", target=str(run_toml)))
     cmd_submit(argparse.Namespace(target=str(run_toml), resume=False, dry=args.dry), what="regress run",
                time_limit=args.time)
+
+
+def cmd_selftest(args):
+    """bootlab selftest: every unit test under the install root's tests/ with this Python (no cluster needed);
+    exits 1 when one fails. install.sh runs it after its own checks and only warns on a failure."""
+    import unittest
+    os.chdir(execute.REPO)
+    prog = unittest.main(module=None, exit=False, verbosity=1,
+                         argv=["bootlab selftest", "discover", "-s", str(execute.REPO / "tests")])
+    raise SystemExit(0 if prog.result.wasSuccessful() else 1)
 
 
 BOOT = "import sys; sys.path.insert(0, sys.argv.pop(1)); from bootlab.cli import main; main(sys.argv[1:])"
@@ -434,6 +482,12 @@ def write_summary(run_dir: Path):
         if (run_dir / "solves.jsonl").exists() else []
     result = json.loads((run_dir / "result.json").read_text()) if (run_dir / "result.json").exists() else None
     coords = run["coords"]["names"]
+    if "scan" in run:
+        out = [f"# {run_dir.name}", "", f"- model: {run['inputs']['model']}, Lambda = {run['numerics']['lambda']}",
+               f"- result: {result['status'] + ': ' + result['reason'] if result else 'not finished'}", ""]
+        short_lines = [{**l, **{k: short(l.get(k)) for k in ("primal", "dual", "gap")}} for l in lines]
+        (run_dir / "summary.md").write_text("\n".join(out + scan.summary_lines(run, short_lines)) + "\n")
+        return
     out = [f"# {run_dir.name}", "",
            f"- model: {run['inputs']['model']}, Lambda = {run['numerics']['lambda']}",
            f"- start: {run['skydive']['start']}",
@@ -453,6 +507,12 @@ def write_summary(run_dir: Path):
                short(l.get("gap")), l["verdict"], l.get("iterations") or "",
                sec.get("pmp", ""), sec.get("sdp", ""), sec.get("dive", "")]
         out.append("| " + " | ".join(map(str, row)) + " |")
+    changes = [l for l in lines if l.get("precision_note")]
+    if changes:      # mixed precision (precision.decide): every change of precision or state, in order
+        out += ["", "Precision:", ""] + [
+            f"- step {l['step']}: {l['precision']} bits, next {l['precision_next']} bits"
+            + (f" ({l['precision_state']})" if "precision_state" in l else "") + f": {l['precision_note']}"
+            for l in changes]
     (run_dir / "summary.md").write_text("\n".join(out) + "\n")
 
 
@@ -496,6 +556,8 @@ def main(argv=None):
     p.add_argument("--dry", action="store_true", help="print the sbatch command only")
     p.add_argument("--wait", action="store_true", help="local mode: run here and wait for PASS or FAIL")
     p.set_defaults(fn=cmd_regress)
+    p = sub.add_parser("selftest", help="every unit test of the installation (no cluster needed)")
+    p.set_defaults(fn=cmd_selftest)
     p = sub.add_parser("probe", help="the cluster probe: plan | node | merge (bootlab.probe)", add_help=False)
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p.set_defaults(fn=lambda a: probe.main(a.rest))

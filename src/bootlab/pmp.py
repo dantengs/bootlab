@@ -18,21 +18,27 @@ from .numbers import Num, dumps
 _LABEL = re.compile(r"^(continuum|isolated)_(.+)_l(\d+)_([ud])(.+?)_mat_")
 
 
-def model_section(problem: Problem, model_file: Path) -> dict:
+def model_section(problem: Problem, model_file: Path, bits=None) -> dict:
+    """bits: the precision of the call the PMP is for. Below the problem's (Problem.solver_precision, a mixed
+    precision call) the generator works at it too, blocks and parts (blockPrecision; at most the problem's
+    block_precision when it sets one); at the problem's precision the request is the one without bits."""
     n = problem.numerics
     out = {"name": "data", "file": str(model_file), "lambda": n["lambda"],
            "blockPreset": n.get("block_preset", "simpleboot")}
     if "block_precision" in n:
         out["blockPrecision"] = n["block_precision"]
+    if bits is not None and bits < problem.solver_precision():
+        out["blockPrecision"] = min(bits, n.get("block_precision", bits))
     if "spins" in n:
         out["spinList"] = n["spins"]
     return out
 
 
-def write_request(problem: Problem, model_file: Path, points: dict, out: Path, blocks: Path, cores: int) -> Path:
-    """points: name -> {coordinate: decimal string}, in problem.coords."""
+def write_request(problem: Problem, model_file: Path, points: dict, out: Path, blocks: Path, cores: int,
+                  bits=None) -> Path:
+    """points: name -> {coordinate: decimal string}, in problem.coords; bits: the call's precision (model_section)."""
     req = {
-        "model": model_section(problem, model_file),
+        "model": model_section(problem, model_file, bits),
         "objective": problem.objective["kind"],
         "points": [{"name": name,
                     "coords": [Num(p[c]) for c in problem.model_coords],
@@ -48,13 +54,22 @@ def write_request(problem: Problem, model_file: Path, points: dict, out: Path, b
     return path
 
 
-def generate(site, node, request: Path, log: Path) -> float:
+def watched(request: Path, log: Path) -> list:
+    """What a generator call changes while it works: its logs, its output directory, its block directory."""
+    return [log.with_suffix(".out"), log.with_suffix(".err"), request.parent,
+            Path(json.loads(request.read_text())["blocks"])]
+
+
+def generate(site, node, request: Path, log: Path, stall_s: float = None) -> float:
     """Run the generator on the whole node (node 0 in a job of several nodes), in the image: site.generator is
     its path there, a script that sets the generator's libraries and its scalar_blocks script and starts it;
-    its workers are processes of the same container. Returns its wall time."""
+    its workers are processes of the same container. stall_s: the call ends as failed when none of its logs,
+    output and block directories changes for that long (execute.wait_watched). Returns its wall time."""
     t = time.time()
-    code = execute.launch(site, node, [site.generator, "pmp", request], 1, node.cores,
-                          node.mem_mb - site.driver_reserve_mb, False, log, hosts=node.solo()).wait()
+    proc = execute.launch(site, node, [site.generator, "pmp", request], 1, node.cores,
+                          node.mem_mb - site.driver_reserve_mb, False, log, hosts=node.solo())
+    code = proc.wait() if stall_s is None else \
+        execute.wait_watched(proc, watched(request, log), stall_s, "generator", log)
     if code != 0:
         raise execute.StepFailed(f"generator exit {code}")
     return time.time() - t
